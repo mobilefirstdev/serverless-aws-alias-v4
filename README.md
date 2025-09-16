@@ -54,8 +54,8 @@ Here's a comprehensive example showing all available configuration options:
 ```yaml
 custom:
   alias:
-    name: ${opt:stage, 'dev'}        # Alias name (defaults to stage)
-    excludedFunctions:               # Functions to exclude from alias management
+    name: ${opt:stage, 'dev'}       # Alias name (defaults to stage)
+    excludedFunctions:              # Functions to exclude from alias management
       - warmUpPluginDefault
       - some-other-function
     skipApiGateway: false           # Skip HTTP API Gateway deployment (default: false)
@@ -198,6 +198,13 @@ Skipping API Gateway deployments can be useful in scenarios such as:
 - **Development workflows**: When you want to update function aliases without triggering API Gateway deployments
 - **Blue-Green deployments**: When Blue-Green API Gateway deployments are handled separately in your CI/CD pipeline
 - **Testing environments**: When you need to update function integrations without affecting live API endpoints
+
+Additionally, you can use CLI flags to override these skip settings during deployment:
+
+- `--skip-api-gateway`: Skip HTTP API Gateway deployment (overrides config)
+- `--skip-websocket-gateway`: Skip WebSocket API Gateway deployment (overrides config)
+
+These flags take precedence over the configuration in serverless.yml and set the corresponding skip option to true when present.
 
 ## Plugin Compatibility and Limitations
 

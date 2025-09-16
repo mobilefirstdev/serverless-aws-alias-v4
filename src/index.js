@@ -77,10 +77,12 @@ class ServerlessLambdaAliasPlugin {
 		this.config.verbose = CUSTOM_ALIAS_CONFIG.verbose ?? false;
 
 		// Load Skip ApiGateway (with CLI flag override)
-		this.config.skipApiGateway = CUSTOM_ALIAS_CONFIG.skipApiGateway ?? false;
+		this.config.skipApiGateway =
+			process.argv.includes('--skip-api-gateway') || (CUSTOM_ALIAS_CONFIG.skipApiGateway ?? false);
 
 		// Load Skip WebSocket Gateway (with CLI flag override)
-		this.config.skipWebSocketGateway = CUSTOM_ALIAS_CONFIG.skipWebSocketGateway ?? false;
+		this.config.skipWebSocketGateway =
+			process.argv.includes('--skip-websocket-gateway') || (CUSTOM_ALIAS_CONFIG.skipWebSocketGateway ?? false);
 
 		// Check what event types are used in this service
 		const { hasHttpEvents, hasWebsocketEvents } = this.detectEventTypes();
