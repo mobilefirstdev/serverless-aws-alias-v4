@@ -18,6 +18,8 @@ class ServerlessLambdaAliasPlugin {
 			apiGatewayResourceCache: new Map(),
 			accountId: null,
 			verbose: false,
+			skipApiGateway: false,
+			skipWebSocketGateway: false,
 			region: this.provider.getRegion(),
 			restApiId: this.serverless.service.provider.apiGateway?.restApiId,
 			websocketApiId: this.serverless.service.provider.websocketApiId,
@@ -72,15 +74,13 @@ class ServerlessLambdaAliasPlugin {
 		this.config.excludedFunctions = new Set(CUSTOM_ALIAS_CONFIG.excludedFunctions || []);
 
 		// Verbose logging
-		this.config.verbose = CUSTOM_ALIAS_CONFIG.verbose || false;
+		this.config.verbose = CUSTOM_ALIAS_CONFIG.verbose ?? false;
 
-		// Load Deploy ApiGateway (with CLI flag override)
-		this.config.skipApiGateway = CUSTOM_ALIAS_CONFIG.skipApiGateway !== undefined 
-				? CUSTOM_ALIAS_CONFIG.skipApiGateway : false;
+		// Load Skip ApiGateway (with CLI flag override)
+		this.config.skipApiGateway = CUSTOM_ALIAS_CONFIG.skipApiGateway ?? false;
 
-		// Load Deploy WebSocket Gateway (with CLI flag override)
-		this.config.skipWebSocketGateway = CUSTOM_ALIAS_CONFIG.skipWebSocketGateway !== undefined 
-			? CUSTOM_ALIAS_CONFIG.skipWebSocketGateway : false;
+		// Load Skip WebSocket Gateway (with CLI flag override)
+		this.config.skipWebSocketGateway = CUSTOM_ALIAS_CONFIG.skipWebSocketGateway ?? false;
 
 		// Check what event types are used in this service
 		const { hasHttpEvents, hasWebsocketEvents } = this.detectEventTypes();
@@ -177,21 +177,18 @@ class ServerlessLambdaAliasPlugin {
 		// Warn if API Gateway deployment is disabled
 		if (this.config.skipApiGateway) {
 			this.debugLog(
-				'WARNING: API Gateway deployment is disabled. ' +
-				'Ensure APIs are deployed manually if integration URIs have changed.',
+				'WARNING: API Gateway deployment has been skipped (skipApiGateway: true). Manual deployment may be required if integration URIs were modified.',
 				true,
-				'warning'
+				'warning',
 			);
 		}
 
 		// Warn if WebSocket Gateway deployment is disabled
-
 		if (this.config.skipWebSocketGateway) {
 			this.debugLog(
-				'WARNING: WebSocket Gateway deployment is disabled. ' +
-				'Ensure APIs are deployed manually if integration URIs have changed.',
+				'WARNING: WebSocket Gateway deployment has been skipped (skipWebSocketGateway: true). Manual deployment may be required if integration URIs were modified.',
 				true,
-				'warning'
+				'warning',
 			);
 		}
 
@@ -262,7 +259,7 @@ class ServerlessLambdaAliasPlugin {
 				// Validate predefined routes have correct format
 				if (ROUTE.startsWith('$') && !VALID_ROUTES.includes(ROUTE)) {
 					INVALID_CONFIG.push(
-						`Function '${funcName}' has invalid WebSocket route '${ROUTE}'. Predefined routes are: ${VALID_ROUTES.join(', ')}`
+						`Function '${funcName}' has invalid WebSocket route '${ROUTE}'. Predefined routes are: ${VALID_ROUTES.join(', ')}`,
 					);
 				}
 			});
