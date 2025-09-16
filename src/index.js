@@ -36,8 +36,8 @@ class ServerlessLambdaAliasPlugin {
 	 * Log messages only when debug mode is enabled.
 	 * Uses different colors for better readability.
 	 */
-	debugLog(message, force = false, type = 'info') {
-		if (IS_DEBUG || this.config.verbose || force) {
+	debugLog(message, { forceShow = false, type = 'info' } = {}) {
+		if (IS_DEBUG || this.config.verbose || forceShow) {
 			let color = '\x1b[0m'; // Reset color
 			switch (type) {
 				case 'success':
@@ -87,7 +87,7 @@ class ServerlessLambdaAliasPlugin {
 		// Check what event types are used in this service
 		const { hasHttpEvents, hasWebsocketEvents } = this.detectEventTypes();
 
-		this.debugLog(`Initialized with Alias: ${this.config.alias}`, false, 'success');
+		this.debugLog(`Initialized with Alias: ${this.config.alias}`, { type: 'success' });
 		this.debugLog(`Region: ${this.config.region}`);
 
 		if (this.config.excludedFunctions.size > 0) {
@@ -98,11 +98,9 @@ class ServerlessLambdaAliasPlugin {
 			if (this.config.restApiId) {
 				this.debugLog(`HTTP API Gateway ID: ${this.config.restApiId}`);
 			} else {
-				this.debugLog(
-					'No REST API ID found in provider config, HTTP API Gateway integrations will be skipped.',
-					false,
-					'warning',
-				);
+				this.debugLog('No REST API ID found in provider config, HTTP API Gateway integrations will be skipped.', {
+					type: 'warning',
+				});
 			}
 		}
 
@@ -112,14 +110,13 @@ class ServerlessLambdaAliasPlugin {
 			} else {
 				this.debugLog(
 					'No WebSocket API ID found in provider config, WebSocket API Gateway integrations will be skipped.',
-					false,
-					'warning',
+					{ type: 'warning' },
 				);
 			}
 		}
 
 		if (!hasHttpEvents && !hasWebsocketEvents) {
-			this.debugLog('No API Gateway events detected in functions.', false, 'warning');
+			this.debugLog('No API Gateway events detected in functions.', { type: 'warning' });
 		}
 	}
 
@@ -180,8 +177,7 @@ class ServerlessLambdaAliasPlugin {
 		if (this.config.skipApiGateway) {
 			this.debugLog(
 				'WARNING: API Gateway deployment has been skipped (skipApiGateway: true). Manual deployment may be required if integration URIs were modified.',
-				true,
-				'warning',
+				{ forceShow: true, type: 'warning' },
 			);
 		}
 
@@ -189,12 +185,11 @@ class ServerlessLambdaAliasPlugin {
 		if (this.config.skipWebSocketGateway) {
 			this.debugLog(
 				'WARNING: WebSocket Gateway deployment has been skipped (skipWebSocketGateway: true). Manual deployment may be required if integration URIs were modified.',
-				true,
-				'warning',
+				{ forceShow: true, type: 'warning' },
 			);
 		}
 
-		this.debugLog('Configuration validated successfully.', false, 'success');
+		this.debugLog('Configuration validated successfully.', { type: 'success' });
 	}
 
 	/**
@@ -304,7 +299,7 @@ class ServerlessLambdaAliasPlugin {
 	 */
 	async deployAliasWorkflow() {
 		try {
-			this.debugLog(`${PLUGIN_NAME}: Starting alias deployment workflow...`, false, 'info');
+			this.debugLog(`${PLUGIN_NAME}: Starting alias deployment workflow...`);
 
 			// Get AWS account ID (needed for ARNs)
 			await this.getAwsAccountId();
@@ -313,7 +308,7 @@ class ServerlessLambdaAliasPlugin {
 			const FUNCTIONS = this.getFunctionsForAliasDeployment();
 
 			if (FUNCTIONS.length === 0) {
-				this.debugLog('No functions to process for alias deployment. Exiting.', true, 'warning');
+				this.debugLog('No functions to process for alias deployment. Exiting.', { forceShow: true, type: 'warning' });
 				return;
 			}
 
@@ -325,8 +320,7 @@ class ServerlessLambdaAliasPlugin {
 			if (CREATED_ALIASES.length === 0) {
 				this.debugLog(
 					'No aliases were created or updated. Consider using the --force flag to force alias deployment if needed.',
-					false,
-					'warning',
+					{ type: 'warning' },
 				);
 				return;
 			}
@@ -339,28 +333,22 @@ class ServerlessLambdaAliasPlugin {
 			if (HTTP_ALIASES.length > 0 && this.config.restApiId) {
 				await this.updateApiGatewayIntegrations(FUNCTIONS, HTTP_ALIASES);
 			} else if (HTTP_ALIASES.length > 0) {
-				this.debugLog('HTTP events found but no REST API ID provided. Skipping HTTP integrations.', false, 'warning');
+				this.debugLog('HTTP events found but no REST API ID provided. Skipping HTTP integrations.', { type: 'warning' });
 			}
 
 			// Process WebSocket API Gateway integrations if needed
 			if (WEBSOCKET_ALIASES.length > 0 && this.config.websocketApiId) {
 				await this.updateWebSocketApiIntegrations(FUNCTIONS, WEBSOCKET_ALIASES);
 			} else if (WEBSOCKET_ALIASES.length > 0) {
-				this.debugLog(
-					'WebSocket events found but no WebSocket API ID provided. Skipping WebSocket integrations.',
-					false,
-					'warning',
-				);
+				this.debugLog('WebSocket events found but no WebSocket API ID provided. Skipping WebSocket integrations.', {
+					type: 'warning',
+				});
 			}
 
-			this.debugLog(
-				`${PLUGIN_NAME}: Successfully deployed aliases for ${CREATED_ALIASES.length} functions.`,
-				false,
-				'info',
-			);
+			this.debugLog(`${PLUGIN_NAME}: Successfully deployed aliases for ${CREATED_ALIASES.length} functions.`);
 		} catch (error) {
-			this.debugLog(`Error in alias deployment workflow: ${error.message}`, true, 'error');
-			this.debugLog(error?.stack, false, 'error');
+			this.debugLog(`Error in alias deployment workflow: ${error.message}`, { forceShow: true, type: 'error' });
+			this.debugLog(error?.stack, { type: 'error' });
 			throw new this.serverless.classes.Error(`Alias deployment failed: ${error.message}`);
 		}
 	}
@@ -401,7 +389,7 @@ class ServerlessLambdaAliasPlugin {
 			this.debugLog(`AWS Account ID: ${this.config.accountId}`);
 			return this.config.accountId;
 		} catch (error) {
-			this.debugLog(`Error getting AWS account ID: ${error.message}`, true, 'error');
+			this.debugLog(`Error getting AWS account ID: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -493,7 +481,10 @@ class ServerlessLambdaAliasPlugin {
 				}
 
 				if (!version) {
-					this.debugLog(`Could not determine version for function: ${FUNCTION.functionName}`, true, 'error');
+					this.debugLog(`Could not determine version for function: ${FUNCTION.functionName}`, {
+						forceShow: true,
+						type: 'error',
+					});
 					FAILED_FUNCTIONS.push(FUNCTION.functionName);
 					continue;
 				}
@@ -512,16 +503,14 @@ class ServerlessLambdaAliasPlugin {
 					});
 					this.debugLog(
 						`Created/updated alias '${this.config.alias}' for function '${FUNCTION.functionName}' pointing to version ${version}`,
-						false,
-						'success',
+						{ type: 'success' },
 					);
 				}
 			} catch (error) {
-				this.debugLog(
-					`Error creating/updating alias for function '${FUNCTION.functionName}': ${error.message}`,
-					true,
-					'error',
-				);
+				this.debugLog(`Error creating/updating alias for function '${FUNCTION.functionName}': ${error.message}`, {
+					forceShow: true,
+					type: 'error',
+				});
 				FAILED_FUNCTIONS.push(FUNCTION.functionName);
 			}
 		}
@@ -530,8 +519,7 @@ class ServerlessLambdaAliasPlugin {
 		if (FAILED_FUNCTIONS.length > 0) {
 			this.debugLog(
 				`WARNING: Failed to process aliases for ${FAILED_FUNCTIONS.length} functions: ${FAILED_FUNCTIONS.join(', ')}`,
-				true,
-				'warning',
+				{ forceShow: true, type: 'warning' },
 			);
 		}
 
@@ -721,11 +709,10 @@ class ServerlessLambdaAliasPlugin {
 				throw error;
 			}
 		} catch (error) {
-			this.debugLog(
-				`Error checking function changes for '${functionData.functionName}': ${error.message}`,
-				true,
-				'error',
-			);
+			this.debugLog(`Error checking function changes for '${functionData.functionName}': ${error.message}`, {
+				forceShow: true,
+				type: 'error',
+			});
 			// In case of error, assume changes to be safe
 			return true;
 		}
@@ -757,18 +744,15 @@ class ServerlessLambdaAliasPlugin {
 				Description: functionData.description || '',
 			}).promise();
 
-			this.debugLog(
-				`Published new version ${RESULT.Version} for function: ${functionData.functionName}`,
-				false,
-				'success',
-			);
+			this.debugLog(`Published new version ${RESULT.Version} for function: ${functionData.functionName}`, {
+				type: 'success',
+			});
 			return RESULT.Version;
 		} catch (error) {
-			this.debugLog(
-				`Error publishing new version for function '${functionData.functionName}': ${error.message}`,
-				true,
-				'error',
-			);
+			this.debugLog(`Error publishing new version for function '${functionData.functionName}': ${error.message}`, {
+				forceShow: true,
+				type: 'error',
+			});
 			throw error;
 		}
 	}
@@ -832,7 +816,7 @@ class ServerlessLambdaAliasPlugin {
 			} catch (funcError) {
 				// If function doesn't exist, log and return null
 				if (funcError.code === 'ResourceNotFoundException') {
-					this.debugLog(`Function '${functionName}' not found`, true, 'warning');
+					this.debugLog(`Function '${functionName}' not found`, { forceShow: true, type: 'warning' });
 					return null;
 				}
 
@@ -857,23 +841,22 @@ class ServerlessLambdaAliasPlugin {
 				}
 
 				// If no published versions found, use the unqualified $LATEST and note this
-				this.debugLog(
-					`No numbered versions found for function: ${functionName}, falling back to $LATEST`,
-					false,
-					'warning',
-				);
+				this.debugLog(`No numbered versions found for function: ${functionName}, falling back to $LATEST`, {
+					type: 'warning',
+				});
 				return '$LATEST';
 			} catch (error) {
 				// If versions can't be listed but function exists, fall back to $LATEST
-				this.debugLog(
-					`Error listing versions for '${functionName}': ${error.message}, falling back to $LATEST`,
-					false,
-					'warning',
-				);
+				this.debugLog(`Error listing versions for '${functionName}': ${error.message}, falling back to $LATEST`, {
+					type: 'warning',
+				});
 				return '$LATEST';
 			}
 		} catch (error) {
-			this.debugLog(`Error getting latest version for function '${functionName}': ${error.message}`, true, 'error');
+			this.debugLog(`Error getting latest version for function '${functionName}': ${error.message}`, {
+				forceShow: true,
+				type: 'error',
+			});
 			throw error;
 		}
 	}
@@ -891,11 +874,9 @@ class ServerlessLambdaAliasPlugin {
 
 			// Special handling for $LATEST
 			if (version === '$LATEST') {
-				this.debugLog(
-					`Using $LATEST version for function '${functionName}' since no published versions found`,
-					false,
-					'warning',
-				);
+				this.debugLog(`Using $LATEST version for function '${functionName}' since no published versions found`, {
+					type: 'warning',
+				});
 			}
 
 			// First, try to get the existing alias
@@ -922,8 +903,7 @@ class ServerlessLambdaAliasPlugin {
 
 				this.debugLog(
 					`Alias '${this.config.alias}' for function '${functionName}' already points to version ${version}. No update needed.`,
-					false,
-					'success',
+					{ type: 'success' },
 				);
 				return EXISTING_ALIAS;
 			} catch (error) {
@@ -943,7 +923,10 @@ class ServerlessLambdaAliasPlugin {
 				throw error;
 			}
 		} catch (error) {
-			this.debugLog(`Error managing alias for function '${functionName}': ${error.message}`, true, 'error');
+			this.debugLog(`Error managing alias for function '${functionName}': ${error.message}`, {
+				forceShow: true,
+				type: 'error',
+			});
 			throw error;
 		}
 	}
@@ -953,11 +936,9 @@ class ServerlessLambdaAliasPlugin {
 	 */
 	async updateApiGatewayIntegrations(functions, httpAliases) {
 		if (!this.config.restApiId || httpAliases.length === 0) {
-			this.debugLog(
-				'Skipping API Gateway integration updates (no REST API ID or no HTTP aliases created)',
-				false,
-				'warning',
-			);
+			this.debugLog('Skipping API Gateway integration updates (no REST API ID or no HTTP aliases created)', {
+				type: 'warning',
+			});
 			return;
 		}
 
@@ -985,13 +966,13 @@ class ServerlessLambdaAliasPlugin {
 
 			// Deploy the API stage to apply changes
 			if (this.config.skipApiGateway) {
-				this.debugLog('HTTP API Gateway integrations updated, deployment skipped as configured.', false, 'success');
+				this.debugLog('HTTP API Gateway integrations updated, deployment skipped as configured.', { type: 'success' });
 			} else {
 				await this.deployApiGateway();
-				this.debugLog('HTTP API Gateway deployed and integrations updated successfully.', false, 'success');
+				this.debugLog('HTTP API Gateway deployed and integrations updated successfully.', { type: 'success' });
 			}
 		} catch (error) {
-			this.debugLog(`Error updating HTTP API Gateway integrations: ${error.message}`, true, 'error');
+			this.debugLog(`Error updating HTTP API Gateway integrations: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1003,8 +984,7 @@ class ServerlessLambdaAliasPlugin {
 		if (!this.config.websocketApiId || websocketAliases.length === 0) {
 			this.debugLog(
 				'Skipping WebSocket API integration updates (no WebSocket API ID or no WebSocket aliases created)',
-				false,
-				'warning',
+				{ type: 'warning' },
 			);
 			return;
 		}
@@ -1033,13 +1013,13 @@ class ServerlessLambdaAliasPlugin {
 
 			// Deploy the WebSocket API stage to apply changes
 			if (this.config.skipWebSocketGateway) {
-				this.debugLog('WebSocket API integrations updated, deployment skipped as configured.', false, 'success');
+				this.debugLog('WebSocket API integrations updated, deployment skipped as configured.', { type: 'success' });
 			} else {
 				await this.deployWebSocketApi();
-				this.debugLog('WebSocket API deployed and integrations updated successfully.', false, 'success');
+				this.debugLog('WebSocket API deployed and integrations updated successfully.', { type: 'success' });
 			}
 		} catch (error) {
-			this.debugLog(`Error updating WebSocket API integrations: ${error.message}`, true, 'error');
+			this.debugLog(`Error updating WebSocket API integrations: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1057,7 +1037,7 @@ class ServerlessLambdaAliasPlugin {
 			this.debugLog(`Found ${RESULT.Items.length} WebSocket API routes.`);
 			return RESULT.Items;
 		} catch (error) {
-			this.debugLog(`Error getting WebSocket API routes: ${error.message}`, true, 'error');
+			this.debugLog(`Error getting WebSocket API routes: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1089,11 +1069,9 @@ class ServerlessLambdaAliasPlugin {
 			const ROUTE = routes.find((route) => route.RouteKey === websocketEvent.route);
 
 			if (!ROUTE) {
-				this.debugLog(
-					`Route not found for key '${websocketEvent.route}'. Skipping integration update.`,
-					false,
-					'warning',
-				);
+				this.debugLog(`Route not found for key '${websocketEvent.route}'. Skipping integration update.`, {
+					type: 'warning',
+				});
 				return;
 			}
 
@@ -1113,7 +1091,7 @@ class ServerlessLambdaAliasPlugin {
 			);
 
 			if (!ROUTE_INTEGRATION) {
-				this.debugLog(`No integration found for route: ${websocketEvent.route}`, false, 'warning');
+				this.debugLog(`No integration found for route: ${websocketEvent.route}`, { type: 'warning' });
 				return;
 			}
 
@@ -1134,15 +1112,13 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(
 				`Successfully updated integration for WebSocket route: ${websocketEvent.route} to use alias: ${this.config.alias}`,
-				false,
-				'success',
+				{ type: 'success' },
 			);
 		} catch (error) {
-			this.debugLog(
-				`Error updating WebSocket API integration for route '${websocketEvent.route}': ${error.message}`,
-				true,
-				'error',
-			);
+			this.debugLog(`Error updating WebSocket API integration for route '${websocketEvent.route}': ${error.message}`, {
+				forceShow: true,
+				type: 'error',
+			});
 			throw error;
 		}
 	}
@@ -1176,7 +1152,7 @@ class ServerlessLambdaAliasPlugin {
 			} catch (error) {
 				// Ignore if the permission doesn't exist
 				if (error.code !== 'ResourceNotFoundException') {
-					this.debugLog(`Warning: ${error.message}`, false, 'warning');
+					this.debugLog(`Warning: ${error.message}`, { type: 'warning' });
 				}
 			}
 
@@ -1191,11 +1167,10 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(
 				`Successfully added permission for WebSocket API Gateway to invoke Lambda alias: ${QUALIFIED_FUNCTION_NAME}`,
-				false,
-				'success',
+				{ type: 'success' },
 			);
 		} catch (error) {
-			this.debugLog(`Error adding WebSocket Lambda permission: ${error.message}`, true, 'error');
+			this.debugLog(`Error adding WebSocket Lambda permission: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1257,11 +1232,11 @@ class ServerlessLambdaAliasPlugin {
 
 			// Print endpoint URL
 			const ENDPOINT_URL = `wss://${this.config.websocketApiId}.execute-api.${this.config.region}.amazonaws.com/${STAGE}`;
-			this.debugLog(`${PLUGIN_NAME}: WebSocket API endpoint: ${ENDPOINT_URL}`, false, 'info');
+			this.debugLog(`${PLUGIN_NAME}: WebSocket API endpoint: ${ENDPOINT_URL}`);
 
-			this.debugLog(`Successfully deployed WebSocket API to stage: ${STAGE}`, false, 'success');
+			this.debugLog(`Successfully deployed WebSocket API to stage: ${STAGE}`, { type: 'success' });
 		} catch (error) {
-			this.debugLog(`Error deploying WebSocket API: ${error.message}`, true, 'error');
+			this.debugLog(`Error deploying WebSocket API: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1296,7 +1271,7 @@ class ServerlessLambdaAliasPlugin {
 			this.debugLog(`Found ${RESULT.items.length} API Gateway resources.`);
 			return RESULT.items;
 		} catch (error) {
-			this.debugLog(`Error getting API Gateway resources: ${error.message}`, true, 'error');
+			this.debugLog(`Error getting API Gateway resources: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1310,11 +1285,9 @@ class ServerlessLambdaAliasPlugin {
 			const RESOURCE = this.findResourceByPath(resources, httpEvent.path);
 
 			if (!RESOURCE) {
-				this.debugLog(
-					`Resource not found for path '${httpEvent.path}'. Skipping integration update.`,
-					false,
-					'warning',
-				);
+				this.debugLog(`Resource not found for path '${httpEvent.path}'. Skipping integration update.`, {
+					type: 'warning',
+				});
 				return;
 			}
 
@@ -1330,13 +1303,11 @@ class ServerlessLambdaAliasPlugin {
 			}).promise();
 
 			if (INTEGRATION) {
-				this.debugLog(`Current integration: ${JSON.stringify(INTEGRATION, null, 2)}`, false, 'info');
+				this.debugLog(`Current integration: ${JSON.stringify(INTEGRATION, null, 2)}`);
 			} else {
-				this.debugLog(
-					`No integration found for path: ${httpEvent.path}, method: ${httpEvent.method}`,
-					false,
-					'warning',
-				);
+				this.debugLog(`No integration found for path: ${httpEvent.path}, method: ${httpEvent.method}`, {
+					type: 'warning',
+				});
 			}
 
 			// Create the new integration URI pointing to the alias
@@ -1363,14 +1334,12 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(
 				`Successfully updated integration for path: ${httpEvent.path}, method: ${httpEvent.method} to use alias: ${this.config.alias}`,
-				false,
-				'success',
+				{ type: 'success' },
 			);
 		} catch (error) {
 			this.debugLog(
 				`Error updating API Gateway integration for path '${httpEvent.path}', method '${httpEvent.method}': ${error.message}`,
-				true,
-				'error',
+				{ forceShow: true, type: 'error' },
 			);
 			throw error;
 		}
@@ -1435,7 +1404,7 @@ class ServerlessLambdaAliasPlugin {
 			} catch (error) {
 				// Ignore if the permission doesn't exist
 				if (error.code !== 'ResourceNotFoundException') {
-					this.debugLog(`Warning: ${error.message}`, false, 'warning');
+					this.debugLog(`Warning: ${error.message}`, { type: 'warning' });
 				}
 			}
 
@@ -1447,7 +1416,7 @@ class ServerlessLambdaAliasPlugin {
 			} catch (error) {
 				// Ignore if the permission doesn't exist
 				if (error.code !== 'ResourceNotFoundException') {
-					this.debugLog(`Warning: ${error.message}`, false, 'warning');
+					this.debugLog(`Warning: ${error.message}`, { type: 'warning' });
 				}
 			}
 
@@ -1471,11 +1440,10 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(
 				`Successfully added permission for API Gateway to invoke Lambda alias: ${QUALIFIED_FUNCTION_NAME}`,
-				false,
-				'success',
+				{ type: 'success' },
 			);
 		} catch (error) {
-			this.debugLog(`Error adding Lambda permission: ${error.message}`, true, 'error');
+			this.debugLog(`Error adding Lambda permission: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
@@ -1516,11 +1484,11 @@ class ServerlessLambdaAliasPlugin {
 
 			// Print endpoint URL
 			const ENDPOINT_URL = `https://${this.config.restApiId}.execute-api.${this.config.region}.amazonaws.com/${STAGE}`;
-			this.debugLog(`${PLUGIN_NAME}: API Gateway endpoint: ${ENDPOINT_URL}`, false, 'info');
+			this.debugLog(`${PLUGIN_NAME}: API Gateway endpoint: ${ENDPOINT_URL}`);
 
-			this.debugLog(`Successfully deployed API Gateway to stage: ${STAGE}`, false, 'success');
+			this.debugLog(`Successfully deployed API Gateway to stage: ${STAGE}`, { type: 'success' });
 		} catch (error) {
-			this.debugLog(`Error deploying API Gateway: ${error.message}`, true, 'error');
+			this.debugLog(`Error deploying API Gateway: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
 		}
 	}
