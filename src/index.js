@@ -7,6 +7,22 @@ const IS_DEBUG = process.env?.SLS_DEBUG || process.argv.includes('--verbose') ||
 // Check if force deployment is requested
 const IS_FORCE = process.argv.includes('--force');
 
+/**
+ * API Gateway stage variable name used to select the Lambda alias at runtime.
+ * Each managed stage has its `alias` variable set to the alias name the stage
+ * routes to. The Lambda integration URI references it as
+ * `:${stageVariables.alias}`, allowing multiple aliases to coexist on one API
+ * by routing per stage.
+ */
+const STAGE_VARIABLE_ALIAS = 'alias';
+
+/**
+ * Allowed alias name pattern. Matches API Gateway stage name rules
+ * (alphanumeric plus `-` and `_`, max 128 chars per AWS docs) and the more
+ * restrictive Lambda alias rules (no `$LATEST`).
+ */
+const VALID_ALIAS_NAME = /^(?!\$LATEST$)[a-zA-Z0-9_-]{1,128}$/;
+
 class ServerlessLambdaAliasPlugin {
 	constructor(serverless) {
 		this.serverless = serverless;
@@ -98,9 +114,9 @@ class ServerlessLambdaAliasPlugin {
 			if (this.config.restApiId) {
 				this.debugLog(`HTTP API Gateway ID: ${this.config.restApiId}`);
 			} else {
-				this.debugLog('No REST API ID found in provider config, HTTP API Gateway integrations will be skipped.', {
-					type: 'warning',
-				});
+				this.debugLog(
+					'No REST API ID in provider config; will attempt to discover from CloudFormation stack outputs at deploy time.',
+				);
 			}
 		}
 
@@ -109,8 +125,7 @@ class ServerlessLambdaAliasPlugin {
 				this.debugLog(`WebSocket API Gateway ID: ${this.config.websocketApiId}`);
 			} else {
 				this.debugLog(
-					'No WebSocket API ID found in provider config, WebSocket API Gateway integrations will be skipped.',
-					{ type: 'warning' },
+					'No WebSocket API ID in provider config; will attempt to discover from CloudFormation stack outputs at deploy time.',
 				);
 			}
 		}
@@ -152,6 +167,14 @@ class ServerlessLambdaAliasPlugin {
 		if (!this.config.alias) {
 			throw new this.serverless.classes.Error(
 				'Alias name is not defined. Configure it under custom.alias or rely on the stage.',
+			);
+		}
+
+		if (!VALID_ALIAS_NAME.test(this.config.alias)) {
+			throw new this.serverless.classes.Error(
+				`Invalid alias name '${this.config.alias}'. Alias names must match ${VALID_ALIAS_NAME} ` +
+					'(alphanumerics, dashes, underscores; up to 128 characters; cannot be "$LATEST"). ' +
+					'This restriction comes from AWS Lambda alias rules and API Gateway stage name rules.',
 			);
 		}
 
@@ -304,6 +327,11 @@ class ServerlessLambdaAliasPlugin {
 			// Get AWS account ID (needed for ARNs)
 			await this.getAwsAccountId();
 
+			// Auto-discover REST/WebSocket API IDs from CloudFormation stack outputs
+			// for services that don't pre-set them via provider config. Pre-set IDs
+			// always win; this only fills in what's missing.
+			await this.discoverApiIdsFromStack();
+
 			// Get all functions that need aliases (excluding the ones in the excludedFunctions set)
 			const FUNCTIONS = this.getFunctionsForAliasDeployment();
 
@@ -371,6 +399,94 @@ class ServerlessLambdaAliasPlugin {
 		if (!FUNCTION) return false;
 
 		return FUNCTION.events.some((event) => event.websocket);
+	}
+
+	/**
+	 * Discovers REST and WebSocket API IDs from the service's CloudFormation
+	 * stack outputs when not pre-supplied via `provider.apiGateway.restApiId`
+	 * or `provider.websocketApiId`.
+	 *
+	 * Serverless Framework auto-emits two stack outputs whose values embed the
+	 * API IDs:
+	 *   - `ServiceEndpoint`           -> https://<rest-api-id>.execute-api.<region>.amazonaws.com/<stage>
+	 *   - `ServiceEndpointWebsocket`  -> wss://<websocket-api-id>.execute-api.<region>.amazonaws.com/<stage>
+	 *
+	 * We parse the API IDs out of those URLs. If the stack does not exist yet
+	 * (no prior deploy) or the outputs are missing, this method is a no-op:
+	 * downstream code falls back to its existing "no API ID -> skip" behavior
+	 * with a clear warning.
+	 *
+	 * Pre-supplied IDs always take precedence; this method never overwrites them.
+	 */
+	async discoverApiIdsFromStack() {
+		// Skip discovery if both IDs are already set
+		if (this.config.restApiId && this.config.websocketApiId) {
+			return;
+		}
+
+		const STACK_NAME = this.provider.naming?.getStackName?.();
+		if (!STACK_NAME) {
+			this.debugLog('Could not determine CloudFormation stack name; skipping API ID discovery.', { type: 'warning' });
+			return;
+		}
+
+		this.debugLog(`Discovering API IDs from CloudFormation stack: ${STACK_NAME}`);
+
+		let outputs;
+		try {
+			const CLOUD_FORMATION = new this.provider.sdk.CloudFormation({ region: this.config.region });
+			const RESULT = await CLOUD_FORMATION.describeStacks({ StackName: STACK_NAME }).promise();
+			outputs = RESULT.Stacks?.[0]?.Outputs || [];
+		} catch (error) {
+			// ValidationError fires when the stack does not exist yet (e.g. brand
+			// new service, first deploy hook running before stack creation completed).
+			// Treat as benign and let downstream code skip API integration updates.
+			if (error.code === 'ValidationError') {
+				this.debugLog(
+					`CloudFormation stack '${STACK_NAME}' not found; skipping API ID discovery. Run 'sls deploy' first.`,
+					{ type: 'warning' },
+				);
+				return;
+			}
+			this.debugLog(`Error describing CloudFormation stack '${STACK_NAME}': ${error.message}`, {
+				type: 'warning',
+			});
+			return;
+		}
+
+		if (!this.config.restApiId) {
+			const REST_URL = outputs.find((o) => o.OutputKey === 'ServiceEndpoint')?.OutputValue;
+			const REST_ID = this.extractApiIdFromEndpointUrl(REST_URL);
+			if (REST_ID) {
+				this.config.restApiId = REST_ID;
+				this.debugLog(`Discovered REST API ID '${REST_ID}' from stack output 'ServiceEndpoint'`);
+			}
+		}
+
+		if (!this.config.websocketApiId) {
+			const WS_URL = outputs.find((o) => o.OutputKey === 'ServiceEndpointWebsocket')?.OutputValue;
+			const WS_ID = this.extractApiIdFromEndpointUrl(WS_URL);
+			if (WS_ID) {
+				this.config.websocketApiId = WS_ID;
+				this.debugLog(`Discovered WebSocket API ID '${WS_ID}' from stack output 'ServiceEndpointWebsocket'`);
+			}
+		}
+	}
+
+	/**
+	 * Extracts the API Gateway API ID from a Serverless-emitted endpoint URL of
+	 * the form `https://<id>.execute-api.<region>.amazonaws.com/<stage>` or
+	 * `wss://<id>.execute-api.<region>.amazonaws.com/<stage>`.
+	 *
+	 * Returns null if the URL is missing or doesn't match the expected shape.
+	 */
+	extractApiIdFromEndpointUrl(url) {
+		if (typeof url !== 'string' || url.length === 0) {
+			return null;
+		}
+		// Match against http(s) and ws(s) protocols defensively.
+		const MATCH = url.match(/^(?:https?|wss?):\/\/([a-z0-9]+)\.execute-api\./i);
+		return MATCH ? MATCH[1] : null;
 	}
 
 	/**
@@ -1095,9 +1211,12 @@ class ServerlessLambdaAliasPlugin {
 				return;
 			}
 
-			// Create the new integration URI pointing to the alias
-			const STAGE_VARIABLES_ALIAS = '${stageVariables.alias}';
-			const LAMBDA_ARN = `arn:aws:lambda:${this.config.region}:${this.config.accountId}:function:${alias.functionName}:${STAGE_VARIABLES_ALIAS}`;
+			// Build an integration URI that picks the Lambda alias at runtime via the
+			// API Gateway stage variable. Each stage we manage sets this variable to
+			// its own alias name, so the same integration routes to different alias
+			// versions per stage.
+			const STAGE_VAR_REF = `\${stageVariables.${STAGE_VARIABLE_ALIAS}}`;
+			const LAMBDA_ARN = `arn:aws:lambda:${this.config.region}:${this.config.accountId}:function:${alias.functionName}:${STAGE_VAR_REF}`;
 			const URI = `arn:aws:apigateway:${this.config.region}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations`;
 
 			// Update the integration to point to the alias
@@ -1176,68 +1295,104 @@ class ServerlessLambdaAliasPlugin {
 	}
 
 	/**
-	 * Deploys the WebSocket API to apply changes.
+	 * Deploys the WebSocket API and ensures stage variables route each managed
+	 * stage to its corresponding Lambda alias.
+	 *
+	 * Mirrors `deployApiGateway` for ApiGatewayV2: a single new deployment is
+	 * created, then both the framework stage and the target alias stage are
+	 * updated to point at it with correct stage variables. The target stage is
+	 * created if it does not yet exist.
 	 */
 	async deployWebSocketApi() {
 		try {
 			this.debugLog(`Deploying WebSocket API (API ID: ${this.config.websocketApiId})...`);
 
 			const API_GATEWAY_V2 = new this.provider.sdk.ApiGatewayV2({ region: this.config.region });
-			const STAGE = this.provider.getStage();
+			const FRAMEWORK_STAGE = this.provider.getStage();
+			const TARGET_STAGE = this.config.alias;
 
-			// Create a new deployment
+			// Step 1: create the deployment snapshot. Unlike REST, V2 createDeployment
+			// does not accept a stageName -- the deployment is bound to a stage via
+			// updateStage / createStage in the next step.
 			const DEPLOYMENT = await API_GATEWAY_V2.createDeployment({
 				ApiId: this.config.websocketApiId,
 				Description: `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`,
 			}).promise();
 
-			this.debugLog(`Created deployment with ID: ${DEPLOYMENT.DeploymentId}`);
+			this.debugLog(`Created WebSocket deployment ${DEPLOYMENT.DeploymentId}`);
 
-			// Update or create the stage with the new deployment
-			try {
-				// First try to get the stage
-				await API_GATEWAY_V2.getStage({
-					ApiId: this.config.websocketApiId,
-					StageName: STAGE,
-				}).promise();
+			// Step 2: bind the target alias stage to the new deployment, creating
+			// the stage if it doesn't exist. The `alias` stage variable routes this
+			// stage to the matching Lambda alias.
+			await this.upsertWebSocketStage(API_GATEWAY_V2, TARGET_STAGE, DEPLOYMENT.DeploymentId, TARGET_STAGE);
 
-				// If stage exists, update it
-				await API_GATEWAY_V2.updateStage({
-					ApiId: this.config.websocketApiId,
-					StageName: STAGE,
-					DeploymentId: DEPLOYMENT.DeploymentId,
-					StageVariables: {
-						alias: this.config.alias,
-					},
-				}).promise();
-
-				this.debugLog(`Updated existing stage: ${STAGE} with new deployment`);
-			} catch (error) {
-				// If stage doesn't exist, create it
-				if (error.code === 'NotFoundException') {
-					await API_GATEWAY_V2.createStage({
-						ApiId: this.config.websocketApiId,
-						StageName: STAGE,
-						DeploymentId: DEPLOYMENT.DeploymentId,
-						StageVariables: {
-							alias: this.config.alias,
-						},
-					}).promise();
-
-					this.debugLog(`Created new stage: ${STAGE} with deployment`);
-				} else {
-					throw error;
-				}
+			// Step 3: when the deploying alias differs from the framework stage,
+			// also refresh the framework stage so its API definition stays in sync
+			// with the latest deploy. Its `alias` variable stays set to the framework
+			// stage name so it routes to the matching Lambda alias.
+			if (TARGET_STAGE !== FRAMEWORK_STAGE) {
+				await this.upsertWebSocketStage(API_GATEWAY_V2, FRAMEWORK_STAGE, DEPLOYMENT.DeploymentId, FRAMEWORK_STAGE);
 			}
 
-			// Print endpoint URL
-			const ENDPOINT_URL = `wss://${this.config.websocketApiId}.execute-api.${this.config.region}.amazonaws.com/${STAGE}`;
+			const ENDPOINT_URL = `wss://${this.config.websocketApiId}.execute-api.${this.config.region}.amazonaws.com/${TARGET_STAGE}`;
 			this.debugLog(`${PLUGIN_NAME}: WebSocket API endpoint: ${ENDPOINT_URL}`);
 
-			this.debugLog(`Successfully deployed WebSocket API to stage: ${STAGE}`, { type: 'success' });
+			this.debugLog(`Successfully deployed WebSocket API to stage '${TARGET_STAGE}'`, { type: 'success' });
 		} catch (error) {
 			this.debugLog(`Error deploying WebSocket API: ${error.message}`, { forceShow: true, type: 'error' });
 			throw error;
+		}
+	}
+
+	/**
+	 * Upserts a WebSocket API stage: updates it to point at the given deployment
+	 * with the `alias` stage variable set, or creates it if it does not exist.
+	 * Idempotent.
+	 */
+	async upsertWebSocketStage(apiGatewayV2, stageName, deploymentId, aliasValue) {
+		const STAGE_VARIABLES = {
+			[STAGE_VARIABLE_ALIAS]: aliasValue,
+		};
+
+		try {
+			await apiGatewayV2
+				.getStage({
+					ApiId: this.config.websocketApiId,
+					StageName: stageName,
+				})
+				.promise();
+
+			await apiGatewayV2
+				.updateStage({
+					ApiId: this.config.websocketApiId,
+					StageName: stageName,
+					DeploymentId: deploymentId,
+					StageVariables: STAGE_VARIABLES,
+				})
+				.promise();
+
+			this.debugLog(
+				`Updated WebSocket stage '${stageName}' onto deployment ${deploymentId}; ${STAGE_VARIABLE_ALIAS}=${aliasValue}`,
+				{ type: 'success' },
+			);
+		} catch (error) {
+			if (error.code !== 'NotFoundException') {
+				throw error;
+			}
+
+			await apiGatewayV2
+				.createStage({
+					ApiId: this.config.websocketApiId,
+					StageName: stageName,
+					DeploymentId: deploymentId,
+					StageVariables: STAGE_VARIABLES,
+				})
+				.promise();
+
+			this.debugLog(
+				`Created WebSocket stage '${stageName}' on deployment ${deploymentId}; ${STAGE_VARIABLE_ALIAS}=${aliasValue}`,
+				{ type: 'success' },
+			);
 		}
 	}
 
@@ -1310,9 +1465,12 @@ class ServerlessLambdaAliasPlugin {
 				});
 			}
 
-			// Create the new integration URI pointing to the alias
-			const STAGE_VARIABLES_ALIAS = '${stageVariables.alias}';
-			const LAMBDA_ARN = `arn:aws:lambda:${this.config.region}:${this.config.accountId}:function:${alias.functionName}:${STAGE_VARIABLES_ALIAS}`;
+			// Build an integration URI that picks the Lambda alias at runtime via the
+			// API Gateway stage variable. Each stage we manage sets this variable to
+			// its own alias name, so the same integration routes to different alias
+			// versions per stage.
+			const STAGE_VAR_REF = `\${stageVariables.${STAGE_VARIABLE_ALIAS}}`;
+			const LAMBDA_ARN = `arn:aws:lambda:${this.config.region}:${this.config.accountId}:function:${alias.functionName}:${STAGE_VAR_REF}`;
 			const URI = `arn:aws:apigateway:${this.config.region}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations`;
 
 			// Update the integration to point to the alias
@@ -1449,46 +1607,135 @@ class ServerlessLambdaAliasPlugin {
 	}
 
 	/**
-	 * Deploys the API Gateway to apply changes.
+	 * Deploys the API Gateway (REST) and ensures the `alias` stage variable
+	 * routes each managed stage to its corresponding Lambda alias.
+	 *
+	 * On every deploy a single new API Gateway deployment is created (a snapshot
+	 * of the current resources/methods/integrations after our integration URI
+	 * patches). We then point the target alias stage (`this.config.alias`) at
+	 * that deployment with `alias` set to the stage's own name. When the
+	 * deploying alias differs from `provider.stage` (e.g. `alias=rc, stage=prod`),
+	 * the framework stage is also refreshed onto the same deployment so both
+	 * stages stay in sync on API definition while preserving each stage's own
+	 * alias routing.
+	 *
+	 * If the target stage does not exist yet (typical on the first multi-alias
+	 * deploy), it is created via `createDeployment(stageName=…)`.
+	 *
+	 * The Lambda alias version pointers (`:prod`, `:rc`, …) are managed by
+	 * `createOrUpdateFunctionAliases` upstream — this method is purely about
+	 * routing existing stages to existing aliases via stage variables.
 	 */
 	async deployApiGateway() {
 		try {
 			this.debugLog(`Deploying API Gateway (REST API ID: ${this.config.restApiId})...`);
 
 			const API_GATEWAY = new this.provider.sdk.APIGateway({ region: this.config.region });
-			const STAGE = this.provider.getStage();
+			const FRAMEWORK_STAGE = this.provider.getStage();
+			const TARGET_STAGE = this.config.alias;
+			const DEPLOY_DESCRIPTION = `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`;
 
-			// Create a new deployment
+			// Step 1: create a deployment snapshot. We always include a stageName so
+			// the call is guaranteed to bind the snapshot to at least one stage
+			// (either updating an existing stage's deploymentId or creating the
+			// stage if missing). We use the target alias stage as that anchor.
 			const DEPLOYMENT = await API_GATEWAY.createDeployment({
 				restApiId: this.config.restApiId,
-				stageName: STAGE,
-				description: `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`,
+				stageName: TARGET_STAGE,
+				description: DEPLOY_DESCRIPTION,
 			}).promise();
 
-			this.debugLog(`Created deployment with ID: ${DEPLOYMENT.id} for stage: ${STAGE}`);
+			this.debugLog(`Created REST deployment ${DEPLOYMENT.id} (anchored on stage '${TARGET_STAGE}')`);
 
-			// Update stage variables
-			await API_GATEWAY.updateStage({
+			// Step 2: ensure the target alias stage carries the `alias` stage
+			// variable. The integration URI references it at runtime; without this
+			// variable, requests to the stage cannot resolve the Lambda alias. We
+			// use a `replace` patch op which creates the variable if absent.
+			await this.patchRestStageAliasVariable(API_GATEWAY, TARGET_STAGE, TARGET_STAGE);
+
+			// Step 3: if we're deploying an alias that differs from the framework
+			// stage (e.g. alias=rc, stage=prod), also refresh the framework stage so
+			// it stays in sync with the latest API definition AND has its `alias`
+			// variable set to its own stage name (so the framework stage routes to
+			// the matching Lambda alias).
+			if (TARGET_STAGE !== FRAMEWORK_STAGE) {
+				await this.refreshRestFrameworkStage(API_GATEWAY, FRAMEWORK_STAGE, DEPLOYMENT.id);
+			}
+
+			const ENDPOINT_URL = `https://${this.config.restApiId}.execute-api.${this.config.region}.amazonaws.com/${TARGET_STAGE}`;
+			this.debugLog(`${PLUGIN_NAME}: API Gateway endpoint: ${ENDPOINT_URL}`);
+
+			this.debugLog(`Successfully deployed REST API to stage '${TARGET_STAGE}'`, { type: 'success' });
+		} catch (error) {
+			this.debugLog(`Error deploying API Gateway: ${error.message}`, { forceShow: true, type: 'error' });
+			throw error;
+		}
+	}
+
+	/**
+	 * Sets the `alias` stage variable on a REST API stage.
+	 * Idempotent — the `replace` patch op creates or updates as needed.
+	 */
+	async patchRestStageAliasVariable(apiGateway, stageName, aliasValue) {
+		await apiGateway
+			.updateStage({
 				restApiId: this.config.restApiId,
-				stageName: STAGE,
+				stageName,
 				patchOperations: [
 					{
 						op: 'replace',
-						path: '/variables/alias',
-						value: this.config.alias,
+						path: `/variables/${STAGE_VARIABLE_ALIAS}`,
+						value: aliasValue,
 					},
 				],
-			}).promise();
+			})
+			.promise();
 
-			this.debugLog(`Set stage variable 'alias=${this.config.alias}' for stage: ${STAGE}`);
+		this.debugLog(`Stage '${stageName}' variable: ${STAGE_VARIABLE_ALIAS}=${aliasValue}`);
+	}
 
-			// Print endpoint URL
-			const ENDPOINT_URL = `https://${this.config.restApiId}.execute-api.${this.config.region}.amazonaws.com/${STAGE}`;
-			this.debugLog(`${PLUGIN_NAME}: API Gateway endpoint: ${ENDPOINT_URL}`);
+	/**
+	 * Refreshes the framework-managed REST API stage so it points at the latest
+	 * deployment and carries the correct `alias` stage variable. Used during
+	 * multi-alias deploys (e.g. `alias=rc, stage=prod`) to keep both stages on
+	 * the same API definition while preserving each stage's own alias routing.
+	 *
+	 * If the framework stage does not yet exist (rare — Serverless creates it on
+	 * the first deploy), this is a no-op with a warning instead of an error.
+	 */
+	async refreshRestFrameworkStage(apiGateway, frameworkStage, deploymentId) {
+		try {
+			await apiGateway
+				.updateStage({
+					restApiId: this.config.restApiId,
+					stageName: frameworkStage,
+					patchOperations: [
+						{
+							op: 'replace',
+							path: '/deploymentId',
+							value: deploymentId,
+						},
+						{
+							op: 'replace',
+							path: `/variables/${STAGE_VARIABLE_ALIAS}`,
+							value: frameworkStage,
+						},
+					],
+				})
+				.promise();
 
-			this.debugLog(`Successfully deployed API Gateway to stage: ${STAGE}`, { type: 'success' });
+			this.debugLog(
+				`Framework stage '${frameworkStage}' refreshed onto deployment ${deploymentId}; ${STAGE_VARIABLE_ALIAS}=${frameworkStage}`,
+				{ type: 'success' },
+			);
 		} catch (error) {
-			this.debugLog(`Error deploying API Gateway: ${error.message}`, { forceShow: true, type: 'error' });
+			if (error.code === 'NotFoundException') {
+				this.debugLog(
+					`Framework stage '${frameworkStage}' does not exist on REST API ${this.config.restApiId}; skipping refresh. (Was the service deployed at least once via 'sls deploy'?)`,
+					{ type: 'warning' },
+				);
+				return;
+			}
 			throw error;
 		}
 	}
