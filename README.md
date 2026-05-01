@@ -152,6 +152,29 @@ Each managed stage receives a single stage variable, `alias`, set to that stage'
 
 The plugin only creates/updates the alias being deployed; on multi-alias deploys it also refreshes the framework stage's deployment so both stages stay in sync on API definition. It never deletes existing stages.
 
+#### Cleanup behavior (important)
+
+This plugin is intentionally **non-destructive** for alias lifecycle:
+
+- It creates/updates API Gateway stages and Lambda aliases as needed.
+- It does **not** automatically delete stale API Gateway stages.
+- It does **not** automatically delete stale Lambda aliases.
+
+If an alias is no longer needed (for example `rc` after testing), clean it up explicitly via AWS CLI or console.
+
+Example cleanup commands:
+
+```bash
+# REST API stage
+aws apigateway delete-stage --rest-api-id <rest-api-id> --stage-name <alias> --region <region>
+
+# WebSocket API stage
+aws apigatewayv2 delete-stage --api-id <websocket-api-id> --stage-name <alias> --region <region>
+
+# Lambda alias (repeat per function)
+aws lambda delete-alias --function-name <lambda-function-name> --name <alias> --region <region>
+```
+
 #### CloudFormation stack output discovery
 
 If you do not pre-set `provider.apiGateway.restApiId` or `provider.websocketApiId`, the plugin discovers them at deploy time from the standard Serverless Framework outputs `ServiceEndpoint` and `ServiceEndpointWebsocket`. No additional configuration is required for services whose REST and WebSocket APIs are created by the same CloudFormation stack.

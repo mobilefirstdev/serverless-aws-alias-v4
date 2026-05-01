@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On multi-alias deploys, the framework stage is refreshed onto the same API Gateway deployment as the alias stage, so both stages stay in sync on API definition while preserving each stage's own alias routing.
 - **Auto-discovery of API IDs from CloudFormation stack outputs.** When `provider.apiGateway.restApiId` and `provider.websocketApiId` are not pre-supplied, the plugin reads the `ServiceEndpoint` and `ServiceEndpointWebsocket` outputs that Serverless Framework emits by default. Pre-supplied IDs always take precedence. Services whose APIs are created in the same stack no longer need extra configuration to enable API Gateway integration management.
 - Validation of the alias name against AWS Lambda alias and API Gateway stage name rules (alphanumerics, dashes, underscores; up to 128 characters; not `$LATEST`). Invalid names are rejected before any AWS calls are made.
+- Documented alias lifecycle semantics: the plugin is non-destructive and does not auto-delete stale API Gateway stages or Lambda aliases; cleanup is manual.
 
 ### Unchanged
 
