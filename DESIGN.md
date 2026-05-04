@@ -10,7 +10,7 @@
 
 `serverless-aws-alias-v4` v0.5.0 correctly creates per-alias **Lambda** aliases (`prod`, `rc`, etc.) but only manages **one API Gateway stage** per service (whatever `provider.stage` resolves to). When deploying with `--param alias=rc`, the rc Lambda alias is created but there's no `rc` API Gateway stage — so the rc alias is unreachable through API Gateway. Without that, you cannot run prod and rc traffic in parallel against different Lambda alias versions inside one CloudFormation stack.
 
-The integration URI templating (`:${stageVariables.alias}`) and the `alias` stage variable already exist in v0.5.0 — they just only ever apply to one stage. This change extends them to additional stages.
+The integration URI templating (`:${stageVariables.SERVERLESS_ALIAS}`) and the `SERVERLESS_ALIAS` stage variable already exist in v0.5.0 — they just only ever apply to one stage. This change extends them to additional stages.
 
 ## Investigation summary (upstream support check)
 
@@ -35,7 +35,7 @@ When `provider.stage` and the deploying alias are the same (the common case), th
 
 When the deploying alias differs from `provider.stage` (e.g. `--stage prod --param alias=rc`):
 
-1. The integration URI templating (`:${stageVariables.alias}`) on each method/route is set as before. This is set once per API and shared across all stages — re-applying is a no-op.
+1. The integration URI templating (`:${stageVariables.SERVERLESS_ALIAS}`) on each method/route is set as before. This is set once per API and shared across all stages — re-applying is a no-op.
 2. A new API Gateway deployment snapshot is created.
 3. A stage named `<alias>` is created on the API (or updated if it exists), pointed at the new deployment, with `alias=<alias>` set as its stage variable.
 4. The framework stage (`provider.stage`) is also refreshed onto the same deployment with its own `alias=<provider.stage>` variable preserved. This keeps both stages on the same API definition (methods, integrations) so they can't drift, while each stage continues to route to its own Lambda alias version via its stage variable.
@@ -70,8 +70,8 @@ Service: `budsense-event-service` (has both REST and WebSocket APIs, uses `prod`
 
 `sls deploy --stage dev` from clean state. Verify:
 - `dev` stage exists with `alias=dev`
-- REST integration URI ends with `:${stageVariables.alias}`
-- WebSocket integration URI ends with `:${stageVariables.alias}`
+- REST integration URI ends with `:${stageVariables.SERVERLESS_ALIAS}`
+- WebSocket integration URI ends with `:${stageVariables.SERVERLESS_ALIAS}`
 - Lambda permission for `:dev` alias on each method/route
 - `GET /dev/get-client-connections` → 200, hits the `:dev` Lambda alias
 
@@ -101,20 +101,20 @@ Same scenarios via `wss://...` connections. WebSocket routes (e.g. `HEARTBEAT`, 
 
 - All existing `custom.alias.*` config keys preserved (`name`, `excludedFunctions`, `verbose`, `skipApiGateway`, `skipWebSocketGateway`).
 - `provider.apiGateway.restApiId` and `provider.websocketApiId` still take precedence; auto-discovery only kicks in when they're absent.
-- Integration URI template unchanged: still `:${stageVariables.alias}`.
-- Stage variable name unchanged: still `alias`.
+- Integration URI template unchanged in behavior: still stage-variable based routing (`:${stageVariables.SERVERLESS_ALIAS}`).
+- Stage variable name uses `SERVERLESS_ALIAS`.
 - Single-alias deploys (where the deploying alias matches `provider.stage`) produce the same AWS state as v0.5.0.
 
 ## Implementation outline
 
 ~280 LOC additions to `src/index.js`. Touch points:
 
-- New constant `STAGE_VARIABLE_ALIAS = 'alias'` (formalizes the existing convention)
+- New constant `STAGE_VARIABLE_ALIAS = 'SERVERLESS_ALIAS'` (formalizes the existing convention)
 - New constant `VALID_ALIAS_NAME` regex
 - `validateConfiguration()` — rejects invalid alias names
 - `initializePlugin()` — relaxes the warning when API IDs are absent (now a soft "will discover" message)
 - `deployAliasWorkflow()` — calls `discoverApiIdsFromStack` after `getAwsAccountId`
-- `updateApiGatewayIntegration()` and `updateWebSocketApiIntegration()` — replace inline `'${stageVariables.alias}'` literal with template referencing the new constant (no behavior change, just refactored)
+- `updateApiGatewayIntegration()` and `updateWebSocketApiIntegration()` — replace inline `'${stageVariables.SERVERLESS_ALIAS}'` literal with template referencing the new constant (no behavior change, just refactored)
 - `deployApiGateway()` — refactored to deploy to the alias-named stage (creating it if missing) and refresh the framework stage on multi-alias deploys
 - `deployWebSocketApi()` — same logic, V2 SDK shape
 - New helpers: `discoverApiIdsFromStack`, `extractApiIdFromEndpointUrl`, `patchRestStageAliasVariable`, `refreshRestFrameworkStage`, `upsertWebSocketStage`

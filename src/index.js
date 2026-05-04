@@ -9,12 +9,12 @@ const IS_FORCE = process.argv.includes('--force');
 
 /**
  * API Gateway stage variable name used to select the Lambda alias at runtime.
- * Each managed stage has its `alias` variable set to the alias name the stage
+ * Each managed stage has its `SERVERLESS_ALIAS` variable set to the alias name the stage
  * routes to. The Lambda integration URI references it as
- * `:${stageVariables.alias}`, allowing multiple aliases to coexist on one API
+ * `:${stageVariables.SERVERLESS_ALIAS}`, allowing multiple aliases to coexist on one API
  * by routing per stage.
  */
-const STAGE_VARIABLE_ALIAS = 'alias';
+const STAGE_VARIABLE_ALIAS = 'SERVERLESS_ALIAS';
 
 /**
  * Allowed alias name pattern. Matches API Gateway stage name rules
@@ -1322,13 +1322,13 @@ class ServerlessLambdaAliasPlugin {
 			this.debugLog(`Created WebSocket deployment ${DEPLOYMENT.DeploymentId}`);
 
 			// Step 2: bind the target alias stage to the new deployment, creating
-			// the stage if it doesn't exist. The `alias` stage variable routes this
+			// the stage if it doesn't exist. The `SERVERLESS_ALIAS` stage variable routes this
 			// stage to the matching Lambda alias.
 			await this.upsertWebSocketStage(API_GATEWAY_V2, TARGET_STAGE, DEPLOYMENT.DeploymentId, TARGET_STAGE);
 
 			// Step 3: when the deploying alias differs from the framework stage,
 			// also refresh the framework stage so its API definition stays in sync
-			// with the latest deploy. Its `alias` variable stays set to the framework
+			// with the latest deploy. Its `SERVERLESS_ALIAS` variable stays set to the framework
 			// stage name so it routes to the matching Lambda alias.
 			if (TARGET_STAGE !== FRAMEWORK_STAGE) {
 				await this.upsertWebSocketStage(API_GATEWAY_V2, FRAMEWORK_STAGE, DEPLOYMENT.DeploymentId, FRAMEWORK_STAGE);
@@ -1346,7 +1346,7 @@ class ServerlessLambdaAliasPlugin {
 
 	/**
 	 * Upserts a WebSocket API stage: updates it to point at the given deployment
-	 * with the `alias` stage variable set, or creates it if it does not exist.
+	 * with the `SERVERLESS_ALIAS` stage variable set, or creates it if it does not exist.
 	 * Idempotent.
 	 */
 	async upsertWebSocketStage(apiGatewayV2, stageName, deploymentId, aliasValue) {
@@ -1607,13 +1607,13 @@ class ServerlessLambdaAliasPlugin {
 	}
 
 	/**
-	 * Deploys the API Gateway (REST) and ensures the `alias` stage variable
+	 * Deploys the API Gateway (REST) and ensures the `SERVERLESS_ALIAS` stage variable
 	 * routes each managed stage to its corresponding Lambda alias.
 	 *
 	 * On every deploy a single new API Gateway deployment is created (a snapshot
 	 * of the current resources/methods/integrations after our integration URI
 	 * patches). We then point the target alias stage (`this.config.alias`) at
-	 * that deployment with `alias` set to the stage's own name. When the
+	 * that deployment with `SERVERLESS_ALIAS` set to the stage's own name. When the
 	 * deploying alias differs from `provider.stage` (e.g. `alias=rc, stage=prod`),
 	 * the framework stage is also refreshed onto the same deployment so both
 	 * stages stay in sync on API definition while preserving each stage's own
@@ -1647,7 +1647,7 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(`Created REST deployment ${DEPLOYMENT.id} (anchored on stage '${TARGET_STAGE}')`);
 
-			// Step 2: ensure the target alias stage carries the `alias` stage
+			// Step 2: ensure the target alias stage carries the `SERVERLESS_ALIAS` stage
 			// variable. The integration URI references it at runtime; without this
 			// variable, requests to the stage cannot resolve the Lambda alias. We
 			// use a `replace` patch op which creates the variable if absent.
@@ -1655,7 +1655,7 @@ class ServerlessLambdaAliasPlugin {
 
 			// Step 3: if we're deploying an alias that differs from the framework
 			// stage (e.g. alias=rc, stage=prod), also refresh the framework stage so
-			// it stays in sync with the latest API definition AND has its `alias`
+			// it stays in sync with the latest API definition AND has its `SERVERLESS_ALIAS`
 			// variable set to its own stage name (so the framework stage routes to
 			// the matching Lambda alias).
 			if (TARGET_STAGE !== FRAMEWORK_STAGE) {
@@ -1673,7 +1673,7 @@ class ServerlessLambdaAliasPlugin {
 	}
 
 	/**
-	 * Sets the `alias` stage variable on a REST API stage.
+	 * Sets the `SERVERLESS_ALIAS` stage variable on a REST API stage.
 	 * Idempotent — the `replace` patch op creates or updates as needed.
 	 */
 	async patchRestStageAliasVariable(apiGateway, stageName, aliasValue) {
@@ -1696,7 +1696,7 @@ class ServerlessLambdaAliasPlugin {
 
 	/**
 	 * Refreshes the framework-managed REST API stage so it points at the latest
-	 * deployment and carries the correct `alias` stage variable. Used during
+	 * deployment and carries the correct `SERVERLESS_ALIAS` stage variable. Used during
 	 * multi-alias deploys (e.g. `alias=rc, stage=prod`) to keep both stages on
 	 * the same API definition while preserving each stage's own alias routing.
 	 *
