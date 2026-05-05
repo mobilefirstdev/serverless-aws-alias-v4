@@ -127,7 +127,7 @@ You can mix both HTTP and WebSocket events in the same service, and the plugin w
 
 ### Multi-alias routing on a single API
 
-Out of the box, deploying with the framework stage as the alias name produces a single API Gateway stage routing to the matching Lambda alias (the `${stageVariables.SERVERLESS_ALIAS}` reference in the Lambda integration URI selects the alias at runtime).
+Out of the box, deploying with the framework stage as the alias name produces a single API Gateway stage routing to the matching Lambda alias (the `${stageVariables.alias}` reference in the Lambda integration URI selects the alias at runtime).
 
 Pass a different alias name via Serverless Framework's standard alias parameter to deploy a **parallel routing surface** for that alias on the **same** REST and WebSocket APIs as the framework stage:
 
@@ -148,7 +148,7 @@ This is the canonical pattern for in-stack blue/green: a single CloudFormation s
 - `https://<api-id>.execute-api.<region>.amazonaws.com/prod/...` invokes the `:prod` Lambda alias
 - `https://<api-id>.execute-api.<region>.amazonaws.com/rc/...` invokes the `:rc` Lambda alias
 
-Each managed stage receives a single stage variable, `SERVERLESS_ALIAS`, set to that stage's name. The plugin templates each Lambda integration URI with `:${stageVariables.SERVERLESS_ALIAS}`, so AWS substitutes the variable at request time and routes the invocation to the correct Lambda alias.
+Each managed stage receives stage variables `alias` and `SERVERLESS_ALIAS`, both set to that stage's name. The plugin templates each Lambda integration URI with `:${stageVariables.alias}`, so AWS substitutes the variable at request time and routes the invocation to the correct Lambda alias. Writing `SERVERLESS_ALIAS` is kept for backwards compatibility with v3-style integrations.
 
 The plugin only creates/updates the alias being deployed; on multi-alias deploys it also refreshes the framework stage's deployment so both stages stay in sync on API definition. It never deletes existing stages.
 

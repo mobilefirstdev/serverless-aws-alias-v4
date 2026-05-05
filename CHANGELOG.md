@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Multi-alias routing on a single API.** Deploying with `--param alias=<name>` (when `<name>` differs from `provider.stage`) now creates a parallel API Gateway stage named `<name>` on the same REST and/or WebSocket API. Both stages share one CloudFormation stack and one set of methods/integrations; each stage routes to its corresponding Lambda alias via the `SERVERLESS_ALIAS` stage variable. This unlocks in-stack blue/green deploys (e.g. keeping `prod` and `rc` on a single stack with shared infrastructure) without any new configuration.
+- **Multi-alias routing on a single API.** Deploying with `--param alias=<name>` (when `<name>` differs from `provider.stage`) now creates a parallel API Gateway stage named `<name>` on the same REST and/or WebSocket API. Both stages share one CloudFormation stack and one set of methods/integrations; each stage routes to its corresponding Lambda alias via stage variables. This unlocks in-stack blue/green deploys (e.g. keeping `prod` and `rc` on a single stack with shared infrastructure) without any new configuration.
 - On multi-alias deploys, the framework stage is refreshed onto the same API Gateway deployment as the alias stage, so both stages stay in sync on API definition while preserving each stage's own alias routing.
 - **Auto-discovery of API IDs from CloudFormation stack outputs.** When `provider.apiGateway.restApiId` and `provider.websocketApiId` are not pre-supplied, the plugin reads the `ServiceEndpoint` and `ServiceEndpointWebsocket` outputs that Serverless Framework emits by default. Pre-supplied IDs always take precedence. Services whose APIs are created in the same stack no longer need extra configuration to enable API Gateway integration management.
 - Validation of the alias name against AWS Lambda alias and API Gateway stage name rules (alphanumerics, dashes, underscores; up to 128 characters; not `$LATEST`). Invalid names are rejected before any AWS calls are made.
@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Switched the API Gateway stage variable used for Lambda alias routing from `alias` to `SERVERLESS_ALIAS` to align with existing service integrations.
+- Standardized integration URI routing on `${stageVariables.alias}` while writing both `alias` and `SERVERLESS_ALIAS` stage variables for compatibility with legacy v3-style integrations.
 
 ### Unchanged
 
