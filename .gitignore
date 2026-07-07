@@ -33,3 +33,6 @@ Thumbs.db
 #! Exception
 !.env.example
 !.env.*.example
+
+# OmO session state (plans, tasks, boulder, notepads)
+.omo/
