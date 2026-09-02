@@ -7,6 +7,13 @@ const IS_DEBUG = process.env?.SLS_DEBUG || process.argv.includes('--verbose') ||
 // Check if force deployment is requested
 const IS_FORCE = process.argv.includes('--force');
 
+/**
+ * Stage variable name used by the original serverless-aws-alias plugin
+ * (Serverless Framework v1). Written alongside `alias` so integrations,
+ * authorizers and templates carried over from that plugin keep resolving.
+ */
+const LEGACY_STAGE_VARIABLE_ALIAS = 'SERVERLESS_ALIAS';
+
 class ServerlessLambdaAliasPlugin {
 	constructor(serverless) {
 		this.serverless = serverless;
@@ -1208,6 +1215,7 @@ class ServerlessLambdaAliasPlugin {
 					DeploymentId: DEPLOYMENT.DeploymentId,
 					StageVariables: {
 						alias: this.config.alias,
+						[LEGACY_STAGE_VARIABLE_ALIAS]: this.config.alias,
 					},
 				}).promise();
 
@@ -1221,6 +1229,7 @@ class ServerlessLambdaAliasPlugin {
 						DeploymentId: DEPLOYMENT.DeploymentId,
 						StageVariables: {
 							alias: this.config.alias,
+							[LEGACY_STAGE_VARIABLE_ALIAS]: this.config.alias,
 						},
 					}).promise();
 
@@ -1477,10 +1486,17 @@ class ServerlessLambdaAliasPlugin {
 						path: '/variables/alias',
 						value: this.config.alias,
 					},
+					{
+						op: 'replace',
+						path: `/variables/${LEGACY_STAGE_VARIABLE_ALIAS}`,
+						value: this.config.alias,
+					},
 				],
 			}).promise();
 
-			this.debugLog(`Set stage variable 'alias=${this.config.alias}' for stage: ${STAGE}`);
+			this.debugLog(
+				`Set stage variables 'alias=${this.config.alias}' and '${LEGACY_STAGE_VARIABLE_ALIAS}=${this.config.alias}' for stage: ${STAGE}`,
+			);
 
 			// Print endpoint URL
 			const ENDPOINT_URL = `https://${this.config.restApiId}.execute-api.${this.config.region}.amazonaws.com/${STAGE}`;

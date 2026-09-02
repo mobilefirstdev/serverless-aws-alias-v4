@@ -123,6 +123,10 @@ provider:
 
 You can mix both HTTP and WebSocket events in the same service, and the plugin will handle both types correctly.
 
+### Migrating from `serverless-aws-alias` (Serverless Framework v1)
+
+The original [`serverless-aws-alias`](https://github.com/serverless-heaven/serverless-aws-alias) plugin, which many services kept using through Serverless Framework v3 and cannot use on v4, routed API Gateway integrations through a stage variable named `SERVERLESS_ALIAS`. To ease that migration, this plugin also writes `SERVERLESS_ALIAS` on every stage it manages, with the same value as the `alias` variable it uses for routing. Integrations the plugin does not rewrite (for example custom resources or hand-authored integrations that still reference `${stageVariables.SERVERLESS_ALIAS}`) keep resolving to the correct Lambda alias during and after the migration.
+
 ### Excluding Functions
 
 To exclude specific functions from alias management:
