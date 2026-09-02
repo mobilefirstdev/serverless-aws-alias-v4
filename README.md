@@ -60,6 +60,7 @@ custom:
       - some-other-function
     skipApiGateway: false           # Skip HTTP API Gateway deployment (default: false)
     skipWebSocketGateway: false     # Skip WebSocket API Gateway deployment (default: false)
+    failOnAliasError: true          # Fail the deploy if any alias could not be updated (default: true)
     verbose: true                   # Enable detailed logging (default: false)
 ```
 
@@ -205,6 +206,19 @@ Additionally, you can use CLI flags to override these skip settings during deplo
 - `--skip-websocket-gateway`: Skip WebSocket API Gateway deployment (overrides config)
 
 These flags take precedence over the configuration in serverless.yml and set the corresponding skip option to true when present.
+
+### Throttling and Failure Handling
+
+Lambda's control-plane APIs (everything except invocations, `GetFunction` and `GetPolicy`) share a single account-wide quota of 15 requests per second that AWS does not raise. When several services deploy at the same time, alias processing can hit `Rate exceeded` errors. The plugin retries every Lambda, API Gateway, CloudFormation and STS call on throttling errors with exponential backoff and jitter (up to 8 retries, capped at 10 seconds per attempt). No configuration is required.
+
+If a function's alias still cannot be processed after retries, the deploy fails with a non-zero exit code so CI can retry it. The previous warn-and-continue behavior can be restored with:
+
+```yaml
+custom:
+  alias:
+    name: dev
+    failOnAliasError: false
+```
 
 ## Plugin Compatibility and Limitations
 

@@ -7,6 +7,26 @@ const IS_DEBUG = process.env?.SLS_DEBUG || process.argv.includes('--verbose') ||
 // Check if force deployment is requested
 const IS_FORCE = process.argv.includes('--force');
 
+/**
+ * Retry tuning for AWS control-plane throttling ("Rate exceeded").
+ *
+ * Lambda's control-plane APIs (everything except invocations, GetFunction and
+ * GetPolicy) share a single 15 req/s account-wide quota that AWS does not
+ * raise, so concurrent service deploys routinely collide. Each throttled call
+ * is retried with exponential backoff and jitter, capped per attempt, so
+ * competing deploys de-synchronize instead of hammering the same window.
+ */
+const THROTTLE_MAX_RETRIES = 8;
+const THROTTLE_BASE_DELAY_MS = 400;
+const THROTTLE_MAX_DELAY_MS = 10000;
+const THROTTLE_ERROR_CODES = new Set([
+	'TooManyRequestsException',
+	'ThrottlingException',
+	'Throttling',
+	'RequestLimitExceeded',
+	'RequestThrottledException',
+]);
+
 class ServerlessLambdaAliasPlugin {
 	constructor(serverless) {
 		this.serverless = serverless;
@@ -20,6 +40,7 @@ class ServerlessLambdaAliasPlugin {
 			verbose: false,
 			skipApiGateway: false,
 			skipWebSocketGateway: false,
+			failOnAliasError: true,
 			region: this.provider.getRegion(),
 			restApiId: this.serverless.service.provider.apiGateway?.restApiId,
 			websocketApiId: this.serverless.service.provider.websocketApiId,
@@ -57,6 +78,88 @@ class ServerlessLambdaAliasPlugin {
 		}
 	}
 
+	/**
+	 * Lazily constructs and caches one SDK client per AWS service for the whole
+	 * deploy, so connections and SDK retry state are reused across calls.
+	 */
+	getSdkClient(serviceName) {
+		if (!this.sdkClients) {
+			this.sdkClients = new Map();
+		}
+
+		if (!this.sdkClients.has(serviceName)) {
+			this.sdkClients.set(serviceName, new this.provider.sdk[serviceName]({ region: this.config.region }));
+		}
+
+		return this.sdkClients.get(serviceName);
+	}
+
+	/**
+	 * Detects AWS throttling errors across SDK versions: v2 sets `error.code`,
+	 * v3 sets `error.name`, and the message is matched as a last resort since
+	 * some shims only surface "Rate exceeded".
+	 */
+	isThrottlingError(error) {
+		if (!error) return false;
+
+		if (THROTTLE_ERROR_CODES.has(error.code) || THROTTLE_ERROR_CODES.has(error.name)) {
+			return true;
+		}
+
+		return typeof error.message === 'string' && /rate exceeded/i.test(error.message);
+	}
+
+	/**
+	 * Runs an AWS call, retrying on throttling errors with exponential backoff
+	 * and jitter. Non-throttling errors (including ResourceNotFoundException,
+	 * which several call sites rely on for control flow) are rethrown
+	 * immediately. `awsCall` must issue a fresh request on each invocation.
+	 */
+	async retryOnThrottle(description, awsCall) {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await awsCall();
+			} catch (error) {
+				if (!this.isThrottlingError(error) || attempt >= THROTTLE_MAX_RETRIES) {
+					throw error;
+				}
+
+				const CAPPED_DELAY = Math.min(THROTTLE_BASE_DELAY_MS * 2 ** attempt, THROTTLE_MAX_DELAY_MS);
+				// Equal jitter: keep half the delay as a floor so retries never fire immediately
+				const DELAY = Math.round(CAPPED_DELAY / 2 + Math.random() * (CAPPED_DELAY / 2));
+
+				this.debugLog(
+					`Throttled on ${description}; retry ${attempt + 1}/${THROTTLE_MAX_RETRIES} in ${DELAY}ms`,
+					{ type: 'warning' },
+				);
+
+				await this.sleep(DELAY);
+			}
+		}
+	}
+
+	/**
+	 * Pauses for `ms` milliseconds. Kept as a method so tests can stub it.
+	 */
+	sleep(ms) {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	/**
+	 * Compares two Lambda environment-variable maps for equality.
+	 */
+	environmentsDiffer(liveEnvironment, desiredEnvironment) {
+		const LIVE = liveEnvironment || {};
+		const DESIRED = desiredEnvironment || {};
+
+		const LIVE_KEYS = Object.keys(LIVE).sort();
+		const DESIRED_KEYS = Object.keys(DESIRED).sort();
+
+		if (LIVE_KEYS.length !== DESIRED_KEYS.length) return true;
+
+		return LIVE_KEYS.some((key, index) => key !== DESIRED_KEYS[index] || LIVE[key] !== DESIRED[key]);
+	}
+
 	// --- Initialization and Validation ---
 
 	/**
@@ -83,6 +186,9 @@ class ServerlessLambdaAliasPlugin {
 		// Load Skip WebSocket Gateway (with CLI flag override)
 		this.config.skipWebSocketGateway =
 			process.argv.includes('--skip-websocket-gateway') || (CUSTOM_ALIAS_CONFIG.skipWebSocketGateway ?? false);
+
+		// Fail the deploy when any function's alias could not be processed
+		this.config.failOnAliasError = CUSTOM_ALIAS_CONFIG.failOnAliasError ?? true;
 
 		// Check what event types are used in this service
 		const { hasHttpEvents, hasWebsocketEvents } = this.detectEventTypes();
@@ -383,8 +489,8 @@ class ServerlessLambdaAliasPlugin {
 
 		try {
 			this.debugLog('Fetching AWS account ID...');
-			const STS = new this.provider.sdk.STS({ region: this.config.region });
-			const IDENTITY = await STS.getCallerIdentity().promise();
+			const STS = this.getSdkClient('STS');
+			const IDENTITY = await this.retryOnThrottle('getCallerIdentity()', () => STS.getCallerIdentity().promise());
 			this.config.accountId = IDENTITY.Account;
 			this.debugLog(`AWS Account ID: ${this.config.accountId}`);
 			return this.config.accountId;
@@ -489,8 +595,9 @@ class ServerlessLambdaAliasPlugin {
 					continue;
 				}
 
-				// Create or update the alias only if needed
-				const ALIAS = await this.createOrUpdateAlias(FUNCTION.functionName, version);
+				// Create or update the alias only if needed. EXISTING_ALIAS is passed
+				// through so createOrUpdateAlias doesn't re-fetch what we already know.
+				const ALIAS = await this.createOrUpdateAlias(FUNCTION.functionName, version, EXISTING_ALIAS);
 
 				if (ALIAS) {
 					CREATED_ALIASES.push({
@@ -515,12 +622,19 @@ class ServerlessLambdaAliasPlugin {
 			}
 		}
 
-		// Check if any functions failed
+		// A failed function may still have its alias pointing at a stale version,
+		// so by default the deploy exits non-zero and CI can retry it.
 		if (FAILED_FUNCTIONS.length > 0) {
 			this.debugLog(
 				`WARNING: Failed to process aliases for ${FAILED_FUNCTIONS.length} functions: ${FAILED_FUNCTIONS.join(', ')}`,
 				{ forceShow: true, type: 'warning' },
 			);
+
+			if (this.config.failOnAliasError) {
+				throw new Error(
+					`Failed to process aliases for ${FAILED_FUNCTIONS.length} function(s): ${FAILED_FUNCTIONS.join(', ')}`,
+				);
+			}
 		}
 
 		return CREATED_ALIASES;
@@ -531,12 +645,14 @@ class ServerlessLambdaAliasPlugin {
 	 */
 	async getExistingAlias(functionName) {
 		try {
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
-			const ALIAS = await LAMBDA.getAlias({
-				FunctionName: functionName,
-				Name: this.config.alias,
-			}).promise();
+			const ALIAS = await this.retryOnThrottle(`getAlias(${functionName}:${this.config.alias})`, () =>
+				LAMBDA.getAlias({
+					FunctionName: functionName,
+					Name: this.config.alias,
+				}).promise(),
+			);
 
 			return ALIAS;
 		} catch (error) {
@@ -556,21 +672,32 @@ class ServerlessLambdaAliasPlugin {
 	 */
 	async haveFunctionChanges(functionData, specificVersion) {
 		try {
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
-			// Get the function's current configuration (from $LATEST)
-			const LATEST_CONFIG = await LAMBDA.getFunctionConfiguration({
-				FunctionName: functionData.functionName,
-			}).promise();
+			// Get the function's current configuration (from $LATEST). GetFunction is
+			// used instead of GetFunctionConfiguration because it has its own 100
+			// req/s quota, keeping these reads out of the shared 15 req/s
+			// control-plane bucket that alias/version writes compete for.
+			const LATEST_CONFIG = (
+				await this.retryOnThrottle(`getFunction(${functionData.functionName})`, () =>
+					LAMBDA.getFunction({
+						FunctionName: functionData.functionName,
+					}).promise(),
+				)
+			).Configuration;
 
 			// Get configuration for the specific version
 			let versionConfig;
 
 			try {
-				versionConfig = await LAMBDA.getFunctionConfiguration({
-					FunctionName: functionData.functionName,
-					Qualifier: specificVersion,
-				}).promise();
+				versionConfig = (
+					await this.retryOnThrottle(`getFunction(${functionData.functionName}:${specificVersion})`, () =>
+						LAMBDA.getFunction({
+							FunctionName: functionData.functionName,
+							Qualifier: specificVersion,
+						}).promise(),
+					)
+				).Configuration;
 
 				// Compare important configuration parameters
 
@@ -669,10 +796,14 @@ class ServerlessLambdaAliasPlugin {
 				// This is checked last because even if the alias points to this version,
 				// the function code or configuration could have changed since that version was created
 				try {
-					const ALIAS_CONFIG = await LAMBDA.getAlias({
-						FunctionName: functionData.functionName,
-						Name: this.config.alias,
-					}).promise();
+					const ALIAS_CONFIG = await this.retryOnThrottle(
+						`getAlias(${functionData.functionName}:${this.config.alias})`,
+						() =>
+							LAMBDA.getAlias({
+								FunctionName: functionData.functionName,
+								Name: this.config.alias,
+							}).promise(),
+					);
 
 					// If the alias exists and already points to the specified version,
 					// and we've reached this point (no changes detected above), no changes are needed
@@ -713,36 +844,74 @@ class ServerlessLambdaAliasPlugin {
 				forceShow: true,
 				type: 'error',
 			});
-			// In case of error, assume changes to be safe
+
+			// Persistent throttling (all backoff retries exhausted) must surface as
+			// a failure. The old "assume changed" fallback would trigger a version
+			// publish — several more calls into the already-saturated bucket.
+			if (this.isThrottlingError(error)) {
+				throw error;
+			}
+
+			// In case of other errors, assume changes to be safe
 			return true;
 		}
 	}
 
 	/**
 	 * Publishes a new version of the Lambda function with updated configuration.
+	 *
+	 * The CloudFormation deploy that runs before this hook applies the same
+	 * merged environment this plugin computes, so $LATEST is almost always
+	 * already correct. The configuration update (and its LastUpdateStatus
+	 * polling) only runs when the live environment actually differs — each
+	 * skipped update saves several calls against Lambda's shared 15 req/s
+	 * control-plane quota.
 	 */
 	async publishNewFunctionVersion(functionData) {
 		try {
 			this.debugLog(`Publishing new version for function: ${functionData.functionName}`);
 
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
-			// Update the function configuration with new environment variables
-			await LAMBDA.updateFunctionConfiguration({
-				FunctionName: functionData.functionName,
-				Environment: {
-					Variables: functionData.environment,
-				},
-			}).promise();
+			// GetFunction has its own 100 req/s quota — see haveFunctionChanges.
+			const LIVE_CONFIG = (
+				await this.retryOnThrottle(`getFunction(${functionData.functionName})`, () =>
+					LAMBDA.getFunction({
+						FunctionName: functionData.functionName,
+					}).promise(),
+				)
+			).Configuration;
 
-			// Wait for the update to complete
-			await this.waitForFunctionUpdateToComplete(functionData.functionName);
+			if (this.environmentsDiffer(LIVE_CONFIG.Environment?.Variables, functionData.environment)) {
+				this.debugLog(
+					`Environment differs from config for function: ${functionData.functionName}. Updating configuration before publish...`,
+				);
+
+				// Update the function configuration with new environment variables
+				await this.retryOnThrottle(`updateFunctionConfiguration(${functionData.functionName})`, () =>
+					LAMBDA.updateFunctionConfiguration({
+						FunctionName: functionData.functionName,
+						Environment: {
+							Variables: functionData.environment,
+						},
+					}).promise(),
+				);
+
+				// Wait for the update to complete
+				await this.waitForFunctionUpdateToComplete(functionData.functionName);
+			} else if (LIVE_CONFIG.LastUpdateStatus === 'InProgress') {
+				// No update of our own, but a prior update (e.g. CloudFormation's) is
+				// still settling — publishing now would fail with a conflict.
+				await this.waitForFunctionUpdateToComplete(functionData.functionName);
+			}
 
 			// Publish a new version
-			const RESULT = await LAMBDA.publishVersion({
-				FunctionName: functionData.functionName,
-				Description: functionData.description || '',
-			}).promise();
+			const RESULT = await this.retryOnThrottle(`publishVersion(${functionData.functionName})`, () =>
+				LAMBDA.publishVersion({
+					FunctionName: functionData.functionName,
+					Description: functionData.description || '',
+				}).promise(),
+			);
 
 			this.debugLog(`Published new version ${RESULT.Version} for function: ${functionData.functionName}`, {
 				type: 'success',
@@ -763,16 +932,20 @@ class ServerlessLambdaAliasPlugin {
 	async waitForFunctionUpdateToComplete(functionName) {
 		this.debugLog(`Waiting for function update to complete: ${functionName}`);
 
-		const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+		const LAMBDA = this.getSdkClient('Lambda');
 		let isUpdating = true;
 		let retries = 0;
 		const MAX_RETRIES = 30;
 
 		while (isUpdating && retries < MAX_RETRIES) {
 			try {
-				const CONFIG = await LAMBDA.getFunctionConfiguration({
-					FunctionName: functionName,
-				}).promise();
+				const CONFIG = (
+					await this.retryOnThrottle(`getFunction(${functionName})`, () =>
+						LAMBDA.getFunction({
+							FunctionName: functionName,
+						}).promise(),
+					)
+				).Configuration;
 
 				if (CONFIG.LastUpdateStatus === 'Successful') {
 					isUpdating = false;
@@ -781,7 +954,7 @@ class ServerlessLambdaAliasPlugin {
 					throw new Error(`Function update failed: ${CONFIG.LastUpdateStatusReason || 'Unknown reason'}`);
 				} else {
 					// Still in progress, wait and retry
-					await new Promise((resolve) => setTimeout(resolve, 1000));
+					await this.sleep(1000);
 					retries++;
 				}
 			} catch (error) {
@@ -789,7 +962,7 @@ class ServerlessLambdaAliasPlugin {
 					throw error;
 				}
 				// For other errors, wait and retry
-				await new Promise((resolve) => setTimeout(resolve, 1000));
+				await this.sleep(1000);
 				retries++;
 			}
 		}
@@ -806,13 +979,15 @@ class ServerlessLambdaAliasPlugin {
 		try {
 			this.debugLog(`Getting latest version for function: ${functionName}`);
 
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
 			// First check if the function exists
 			try {
-				await LAMBDA.getFunction({
-					FunctionName: functionName,
-				}).promise();
+				await this.retryOnThrottle(`getFunction(${functionName})`, () =>
+					LAMBDA.getFunction({
+						FunctionName: functionName,
+					}).promise(),
+				);
 			} catch (funcError) {
 				// If function doesn't exist, log and return null
 				if (funcError.code === 'ResourceNotFoundException') {
@@ -825,10 +1000,12 @@ class ServerlessLambdaAliasPlugin {
 
 			// Try to get versions - if no versions exist, we'll use $LATEST
 			try {
-				const RESULT = await LAMBDA.listVersionsByFunction({
-					FunctionName: functionName,
-					MaxItems: 20,
-				}).promise();
+				const RESULT = await this.retryOnThrottle(`listVersionsByFunction(${functionName})`, () =>
+					LAMBDA.listVersionsByFunction({
+						FunctionName: functionName,
+						MaxItems: 20,
+					}).promise(),
+				);
 
 				// Filter out $LATEST and sort versions in descending order
 				const VERSIONS = RESULT.Versions.filter((version) => version.Version !== '$LATEST').sort(
@@ -846,6 +1023,12 @@ class ServerlessLambdaAliasPlugin {
 				});
 				return '$LATEST';
 			} catch (error) {
+				// Persistent throttling must fail the lookup rather than silently
+				// pinning the alias to $LATEST.
+				if (this.isThrottlingError(error)) {
+					throw error;
+				}
+
 				// If versions can't be listed but function exists, fall back to $LATEST
 				this.debugLog(`Error listing versions for '${functionName}': ${error.message}, falling back to $LATEST`, {
 					type: 'warning',
@@ -863,14 +1046,19 @@ class ServerlessLambdaAliasPlugin {
 
 	/**
 	 * Creates or updates a Lambda function alias.
+	 *
+	 * `knownAlias` is the result of an earlier getExistingAlias lookup: the
+	 * alias object, or null when the lookup confirmed the alias doesn't exist.
+	 * Passing it avoids a redundant getAlias call per function. When undefined
+	 * (not looked up), the alias is fetched here as before.
 	 */
-	async createOrUpdateAlias(functionName, version) {
+	async createOrUpdateAlias(functionName, version, knownAlias = undefined) {
 		try {
 			// Validate inputs
 			if (!functionName) throw new Error('Function name is required');
 			if (!version) throw new Error('Function version is required');
 
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
 			// Special handling for $LATEST
 			if (version === '$LATEST') {
@@ -879,49 +1067,50 @@ class ServerlessLambdaAliasPlugin {
 				});
 			}
 
-			// First, try to get the existing alias
-			try {
+			let existingAlias = knownAlias;
+
+			if (existingAlias === undefined) {
 				this.debugLog(`Checking if alias '${this.config.alias}' exists for function '${functionName}'`);
-				const EXISTING_ALIAS = await LAMBDA.getAlias({
-					FunctionName: functionName,
-					Name: this.config.alias,
-				}).promise();
-
-				// If alias exists but points to a different version, update it
-				if (EXISTING_ALIAS.FunctionVersion !== version) {
-					this.debugLog(
-						`Updating alias '${this.config.alias}' for function '${functionName}' from version ${EXISTING_ALIAS.FunctionVersion} to ${version}`,
-					);
-
-					return await LAMBDA.updateAlias({
-						FunctionName: functionName,
-						Name: this.config.alias,
-						FunctionVersion: version,
-						Description: `Alias for ${this.config.alias}`,
-					}).promise();
-				}
-
-				this.debugLog(
-					`Alias '${this.config.alias}' for function '${functionName}' already points to version ${version}. No update needed.`,
-					{ type: 'success' },
-				);
-				return EXISTING_ALIAS;
-			} catch (error) {
-				// If alias doesn't exist, create it
-				if (error.code === 'ResourceNotFoundException') {
-					this.debugLog(
-						`Creating new alias '${this.config.alias}' for function '${functionName}' pointing to version ${version}`,
-					);
-
-					return await LAMBDA.createAlias({
-						FunctionName: functionName,
-						Name: this.config.alias,
-						FunctionVersion: version,
-						Description: `Alias for ${this.config.alias}`,
-					}).promise();
-				}
-				throw error;
+				existingAlias = await this.getExistingAlias(functionName);
 			}
+
+			// If alias doesn't exist, create it
+			if (existingAlias === null) {
+				this.debugLog(
+					`Creating new alias '${this.config.alias}' for function '${functionName}' pointing to version ${version}`,
+				);
+
+				return await this.retryOnThrottle(`createAlias(${functionName}:${this.config.alias})`, () =>
+					LAMBDA.createAlias({
+						FunctionName: functionName,
+						Name: this.config.alias,
+						FunctionVersion: version,
+						Description: `Alias for ${this.config.alias}`,
+					}).promise(),
+				);
+			}
+
+			// If alias exists but points to a different version, update it
+			if (existingAlias.FunctionVersion !== version) {
+				this.debugLog(
+					`Updating alias '${this.config.alias}' for function '${functionName}' from version ${existingAlias.FunctionVersion} to ${version}`,
+				);
+
+				return await this.retryOnThrottle(`updateAlias(${functionName}:${this.config.alias})`, () =>
+					LAMBDA.updateAlias({
+						FunctionName: functionName,
+						Name: this.config.alias,
+						FunctionVersion: version,
+						Description: `Alias for ${this.config.alias}`,
+					}).promise(),
+				);
+			}
+
+			this.debugLog(
+				`Alias '${this.config.alias}' for function '${functionName}' already points to version ${version}. No update needed.`,
+				{ type: 'success' },
+			);
+			return existingAlias;
 		} catch (error) {
 			this.debugLog(`Error managing alias for function '${functionName}': ${error.message}`, {
 				forceShow: true,
@@ -1031,8 +1220,10 @@ class ServerlessLambdaAliasPlugin {
 		try {
 			this.debugLog(`Getting WebSocket API routes for API ID: ${this.config.websocketApiId}`);
 
-			const API_GATEWAY_V2 = new this.provider.sdk.ApiGatewayV2({ region: this.config.region });
-			const RESULT = await API_GATEWAY_V2.getRoutes({ ApiId: this.config.websocketApiId }).promise();
+			const API_GATEWAY_V2 = this.getSdkClient('ApiGatewayV2');
+			const RESULT = await this.retryOnThrottle(`getRoutes(${this.config.websocketApiId})`, () =>
+				API_GATEWAY_V2.getRoutes({ ApiId: this.config.websocketApiId }).promise(),
+			);
 
 			this.debugLog(`Found ${RESULT.Items.length} WebSocket API routes.`);
 			return RESULT.Items;
@@ -1077,12 +1268,14 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(`Updating integration for WebSocket route: ${websocketEvent.route}`);
 
-			const API_GATEWAY_V2 = new this.provider.sdk.ApiGatewayV2({ region: this.config.region });
+			const API_GATEWAY_V2 = this.getSdkClient('ApiGatewayV2');
 
 			// Get current integration for the route
-			const INTEGRATIONS = await API_GATEWAY_V2.getIntegrations({
-				ApiId: this.config.websocketApiId,
-			}).promise();
+			const INTEGRATIONS = await this.retryOnThrottle(`getIntegrations(${this.config.websocketApiId})`, () =>
+				API_GATEWAY_V2.getIntegrations({
+					ApiId: this.config.websocketApiId,
+				}).promise(),
+			);
 
 			const ROUTE_INTEGRATION = INTEGRATIONS.Items.find(
 				(integration) =>
@@ -1101,11 +1294,13 @@ class ServerlessLambdaAliasPlugin {
 			const URI = `arn:aws:apigateway:${this.config.region}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations`;
 
 			// Update the integration to point to the alias
-			await API_GATEWAY_V2.updateIntegration({
-				ApiId: this.config.websocketApiId,
-				IntegrationId: ROUTE_INTEGRATION.IntegrationId,
-				IntegrationUri: URI,
-			}).promise();
+			await this.retryOnThrottle(`updateIntegration(${ROUTE_INTEGRATION.IntegrationId})`, () =>
+				API_GATEWAY_V2.updateIntegration({
+					ApiId: this.config.websocketApiId,
+					IntegrationId: ROUTE_INTEGRATION.IntegrationId,
+					IntegrationUri: URI,
+				}).promise(),
+			);
 
 			// Add permission for WebSocket API Gateway to invoke the Lambda alias
 			await this.addWebSocketLambdaPermission(alias, ROUTE.RouteId, websocketEvent.route);
@@ -1128,7 +1323,7 @@ class ServerlessLambdaAliasPlugin {
 	 */
 	async addWebSocketLambdaPermission(alias, routeId, routeKey) {
 		try {
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
 			// Get the qualified function ARN with the alias
 			const QUALIFIED_FUNCTION_NAME = `${alias.functionName}:${this.config.alias}`;
@@ -1145,10 +1340,12 @@ class ServerlessLambdaAliasPlugin {
 
 			// Try to remove any existing permissions first
 			try {
-				await LAMBDA.removePermission({
-					FunctionName: QUALIFIED_FUNCTION_NAME,
-					StatementId: STATEMENT_ID,
-				}).promise();
+				await this.retryOnThrottle(`removePermission(${QUALIFIED_FUNCTION_NAME})`, () =>
+					LAMBDA.removePermission({
+						FunctionName: QUALIFIED_FUNCTION_NAME,
+						StatementId: STATEMENT_ID,
+					}).promise(),
+				);
 			} catch (error) {
 				// Ignore if the permission doesn't exist
 				if (error.code !== 'ResourceNotFoundException') {
@@ -1157,13 +1354,15 @@ class ServerlessLambdaAliasPlugin {
 			}
 
 			// Add the permission
-			await LAMBDA.addPermission({
-				FunctionName: QUALIFIED_FUNCTION_NAME,
-				StatementId: STATEMENT_ID,
-				Action: 'lambda:InvokeFunction',
-				Principal: 'apigateway.amazonaws.com',
-				SourceArn: SOURCE_ARN,
-			}).promise();
+			await this.retryOnThrottle(`addPermission(${QUALIFIED_FUNCTION_NAME})`, () =>
+				LAMBDA.addPermission({
+					FunctionName: QUALIFIED_FUNCTION_NAME,
+					StatementId: STATEMENT_ID,
+					Action: 'lambda:InvokeFunction',
+					Principal: 'apigateway.amazonaws.com',
+					SourceArn: SOURCE_ARN,
+				}).promise(),
+			);
 
 			this.debugLog(
 				`Successfully added permission for WebSocket API Gateway to invoke Lambda alias: ${QUALIFIED_FUNCTION_NAME}`,
@@ -1182,47 +1381,55 @@ class ServerlessLambdaAliasPlugin {
 		try {
 			this.debugLog(`Deploying WebSocket API (API ID: ${this.config.websocketApiId})...`);
 
-			const API_GATEWAY_V2 = new this.provider.sdk.ApiGatewayV2({ region: this.config.region });
+			const API_GATEWAY_V2 = this.getSdkClient('ApiGatewayV2');
 			const STAGE = this.provider.getStage();
 
 			// Create a new deployment
-			const DEPLOYMENT = await API_GATEWAY_V2.createDeployment({
-				ApiId: this.config.websocketApiId,
-				Description: `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`,
-			}).promise();
+			const DEPLOYMENT = await this.retryOnThrottle(`createDeployment(${this.config.websocketApiId})`, () =>
+				API_GATEWAY_V2.createDeployment({
+					ApiId: this.config.websocketApiId,
+					Description: `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`,
+				}).promise(),
+			);
 
 			this.debugLog(`Created deployment with ID: ${DEPLOYMENT.DeploymentId}`);
 
 			// Update or create the stage with the new deployment
 			try {
 				// First try to get the stage
-				await API_GATEWAY_V2.getStage({
-					ApiId: this.config.websocketApiId,
-					StageName: STAGE,
-				}).promise();
+				await this.retryOnThrottle(`getStage(${STAGE})`, () =>
+					API_GATEWAY_V2.getStage({
+						ApiId: this.config.websocketApiId,
+						StageName: STAGE,
+					}).promise(),
+				);
 
 				// If stage exists, update it
-				await API_GATEWAY_V2.updateStage({
-					ApiId: this.config.websocketApiId,
-					StageName: STAGE,
-					DeploymentId: DEPLOYMENT.DeploymentId,
-					StageVariables: {
-						alias: this.config.alias,
-					},
-				}).promise();
-
-				this.debugLog(`Updated existing stage: ${STAGE} with new deployment`);
-			} catch (error) {
-				// If stage doesn't exist, create it
-				if (error.code === 'NotFoundException') {
-					await API_GATEWAY_V2.createStage({
+				await this.retryOnThrottle(`updateStage(${STAGE})`, () =>
+					API_GATEWAY_V2.updateStage({
 						ApiId: this.config.websocketApiId,
 						StageName: STAGE,
 						DeploymentId: DEPLOYMENT.DeploymentId,
 						StageVariables: {
 							alias: this.config.alias,
 						},
-					}).promise();
+					}).promise(),
+				);
+
+				this.debugLog(`Updated existing stage: ${STAGE} with new deployment`);
+			} catch (error) {
+				// If stage doesn't exist, create it
+				if (error.code === 'NotFoundException') {
+					await this.retryOnThrottle(`createStage(${STAGE})`, () =>
+						API_GATEWAY_V2.createStage({
+							ApiId: this.config.websocketApiId,
+							StageName: STAGE,
+							DeploymentId: DEPLOYMENT.DeploymentId,
+							StageVariables: {
+								alias: this.config.alias,
+							},
+						}).promise(),
+					);
 
 					this.debugLog(`Created new stage: ${STAGE} with deployment`);
 				} else {
@@ -1265,8 +1472,10 @@ class ServerlessLambdaAliasPlugin {
 		try {
 			this.debugLog(`Getting API Gateway resources for REST API ID: ${this.config.restApiId}`);
 
-			const API_GATEWAY = new this.provider.sdk.APIGateway({ region: this.config.region });
-			const RESULT = await API_GATEWAY.getResources({ restApiId: this.config.restApiId, limit: 500 }).promise();
+			const API_GATEWAY = this.getSdkClient('APIGateway');
+			const RESULT = await this.retryOnThrottle(`getResources(${this.config.restApiId})`, () =>
+				API_GATEWAY.getResources({ restApiId: this.config.restApiId, limit: 500 }).promise(),
+			);
 
 			this.debugLog(`Found ${RESULT.items.length} API Gateway resources.`);
 			return RESULT.items;
@@ -1293,14 +1502,16 @@ class ServerlessLambdaAliasPlugin {
 
 			this.debugLog(`Updating integration for path: ${httpEvent.path}, method: ${httpEvent.method}`);
 
-			const API_GATEWAY = new this.provider.sdk.APIGateway({ region: this.config.region });
+			const API_GATEWAY = this.getSdkClient('APIGateway');
 
 			// Get the current integration
-			const INTEGRATION = await API_GATEWAY.getIntegration({
-				restApiId: this.config.restApiId,
-				resourceId: RESOURCE.id,
-				httpMethod: httpEvent.method,
-			}).promise();
+			const INTEGRATION = await this.retryOnThrottle(`getIntegration(${httpEvent.method} ${httpEvent.path})`, () =>
+				API_GATEWAY.getIntegration({
+					restApiId: this.config.restApiId,
+					resourceId: RESOURCE.id,
+					httpMethod: httpEvent.method,
+				}).promise(),
+			);
 
 			if (INTEGRATION) {
 				this.debugLog(`Current integration: ${JSON.stringify(INTEGRATION, null, 2)}`);
@@ -1316,18 +1527,20 @@ class ServerlessLambdaAliasPlugin {
 			const URI = `arn:aws:apigateway:${this.config.region}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations`;
 
 			// Update the integration to point to the alias
-			await API_GATEWAY.updateIntegration({
-				restApiId: this.config.restApiId,
-				resourceId: RESOURCE.id,
-				httpMethod: httpEvent.method,
-				patchOperations: [
-					{
-						op: 'replace',
-						path: '/uri',
-						value: URI,
-					},
-				],
-			}).promise();
+			await this.retryOnThrottle(`updateIntegration(${httpEvent.method} ${httpEvent.path})`, () =>
+				API_GATEWAY.updateIntegration({
+					restApiId: this.config.restApiId,
+					resourceId: RESOURCE.id,
+					httpMethod: httpEvent.method,
+					patchOperations: [
+						{
+							op: 'replace',
+							path: '/uri',
+							value: URI,
+						},
+					],
+				}).promise(),
+			);
 
 			// Add permission for API Gateway to invoke the Lambda alias
 			await this.addLambdaPermission(alias, RESOURCE.id, httpEvent.method, httpEvent.path);
@@ -1373,7 +1586,7 @@ class ServerlessLambdaAliasPlugin {
 	 */
 	async addLambdaPermission(alias, resourceId, method, path) {
 		try {
-			const LAMBDA = new this.provider.sdk.Lambda({ region: this.config.region });
+			const LAMBDA = this.getSdkClient('Lambda');
 
 			// Get the qualified function ARN with the alias
 			const QUALIFIED_FUNCTION_NAME = `${alias.functionName}:${this.config.alias}`;
@@ -1397,10 +1610,12 @@ class ServerlessLambdaAliasPlugin {
 
 			// Try to remove any existing permissions first
 			try {
-				await LAMBDA.removePermission({
-					FunctionName: QUALIFIED_FUNCTION_NAME,
-					StatementId: STAGE_STATEMENT_ID,
-				}).promise();
+				await this.retryOnThrottle(`removePermission(${QUALIFIED_FUNCTION_NAME})`, () =>
+					LAMBDA.removePermission({
+						FunctionName: QUALIFIED_FUNCTION_NAME,
+						StatementId: STAGE_STATEMENT_ID,
+					}).promise(),
+				);
 			} catch (error) {
 				// Ignore if the permission doesn't exist
 				if (error.code !== 'ResourceNotFoundException') {
@@ -1409,10 +1624,12 @@ class ServerlessLambdaAliasPlugin {
 			}
 
 			try {
-				await LAMBDA.removePermission({
-					FunctionName: QUALIFIED_FUNCTION_NAME,
-					StatementId: TEST_STATEMENT_ID,
-				}).promise();
+				await this.retryOnThrottle(`removePermission(${QUALIFIED_FUNCTION_NAME})`, () =>
+					LAMBDA.removePermission({
+						FunctionName: QUALIFIED_FUNCTION_NAME,
+						StatementId: TEST_STATEMENT_ID,
+					}).promise(),
+				);
 			} catch (error) {
 				// Ignore if the permission doesn't exist
 				if (error.code !== 'ResourceNotFoundException') {
@@ -1421,22 +1638,26 @@ class ServerlessLambdaAliasPlugin {
 			}
 
 			// Add the stage invocation permission
-			await LAMBDA.addPermission({
-				FunctionName: QUALIFIED_FUNCTION_NAME,
-				StatementId: STAGE_STATEMENT_ID,
-				Action: 'lambda:InvokeFunction',
-				Principal: 'apigateway.amazonaws.com',
-				SourceArn: SOURCE_ARN,
-			}).promise();
+			await this.retryOnThrottle(`addPermission(${QUALIFIED_FUNCTION_NAME})`, () =>
+				LAMBDA.addPermission({
+					FunctionName: QUALIFIED_FUNCTION_NAME,
+					StatementId: STAGE_STATEMENT_ID,
+					Action: 'lambda:InvokeFunction',
+					Principal: 'apigateway.amazonaws.com',
+					SourceArn: SOURCE_ARN,
+				}).promise(),
+			);
 
 			// Add permission for test invocations
-			await LAMBDA.addPermission({
-				FunctionName: QUALIFIED_FUNCTION_NAME,
-				StatementId: TEST_STATEMENT_ID,
-				Action: 'lambda:InvokeFunction',
-				Principal: 'apigateway.amazonaws.com',
-				SourceArn: `arn:aws:execute-api:${this.config.region}:${this.config.accountId}:${this.config.restApiId}/test-invoke-stage/${method}${path.startsWith('/') ? path : `/${path}`}`,
-			}).promise();
+			await this.retryOnThrottle(`addPermission(${QUALIFIED_FUNCTION_NAME})`, () =>
+				LAMBDA.addPermission({
+					FunctionName: QUALIFIED_FUNCTION_NAME,
+					StatementId: TEST_STATEMENT_ID,
+					Action: 'lambda:InvokeFunction',
+					Principal: 'apigateway.amazonaws.com',
+					SourceArn: `arn:aws:execute-api:${this.config.region}:${this.config.accountId}:${this.config.restApiId}/test-invoke-stage/${method}${path.startsWith('/') ? path : `/${path}`}`,
+				}).promise(),
+			);
 
 			this.debugLog(
 				`Successfully added permission for API Gateway to invoke Lambda alias: ${QUALIFIED_FUNCTION_NAME}`,
@@ -1455,30 +1676,34 @@ class ServerlessLambdaAliasPlugin {
 		try {
 			this.debugLog(`Deploying API Gateway (REST API ID: ${this.config.restApiId})...`);
 
-			const API_GATEWAY = new this.provider.sdk.APIGateway({ region: this.config.region });
+			const API_GATEWAY = this.getSdkClient('APIGateway');
 			const STAGE = this.provider.getStage();
 
 			// Create a new deployment
-			const DEPLOYMENT = await API_GATEWAY.createDeployment({
-				restApiId: this.config.restApiId,
-				stageName: STAGE,
-				description: `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`,
-			}).promise();
+			const DEPLOYMENT = await this.retryOnThrottle(`createDeployment(${this.config.restApiId})`, () =>
+				API_GATEWAY.createDeployment({
+					restApiId: this.config.restApiId,
+					stageName: STAGE,
+					description: `Deployed by ${PLUGIN_NAME} for alias: ${this.config.alias}`,
+				}).promise(),
+			);
 
 			this.debugLog(`Created deployment with ID: ${DEPLOYMENT.id} for stage: ${STAGE}`);
 
 			// Update stage variables
-			await API_GATEWAY.updateStage({
-				restApiId: this.config.restApiId,
-				stageName: STAGE,
-				patchOperations: [
-					{
-						op: 'replace',
-						path: '/variables/alias',
-						value: this.config.alias,
-					},
-				],
-			}).promise();
+			await this.retryOnThrottle(`updateStage(${STAGE})`, () =>
+				API_GATEWAY.updateStage({
+					restApiId: this.config.restApiId,
+					stageName: STAGE,
+					patchOperations: [
+						{
+							op: 'replace',
+							path: '/variables/alias',
+							value: this.config.alias,
+						},
+					],
+				}).promise(),
+			);
 
 			this.debugLog(`Set stage variable 'alias=${this.config.alias}' for stage: ${STAGE}`);
 
