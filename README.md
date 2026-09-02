@@ -13,6 +13,8 @@ Key features:
 
 - Automatically creates and maintains Lambda aliases corresponding to deployment stages.
 - Redirects API Gateway integrations to the appropriate Lambda function aliases.
+- **Multi-alias routing on a single API**: deploy a non-default alias (e.g. `rc`) into the same CloudFormation stack as `prod` and the plugin creates a parallel API Gateway stage that routes to the alias-versioned Lambda. Multiple aliases coexist on one REST/WebSocket API.
+- **Auto-discovery of API IDs** from CloudFormation stack outputs (`ServiceEndpoint`, `ServiceEndpointWebsocket`) when not pre-supplied via `provider.apiGateway.restApiId` / `provider.websocketApiId`.
 - Supports both HTTP (REST API) and WebSocket API Gateway events.
 - Handles mixed services with both HTTP and WebSocket events simultaneously.
 - Handles Lambda permission configuration for API Gateway invocations.
@@ -122,6 +124,66 @@ provider:
 ```
 
 You can mix both HTTP and WebSocket events in the same service, and the plugin will handle both types correctly.
+
+### Multi-alias routing on a single API
+
+Out of the box, deploying with the framework stage as the alias name produces a single API Gateway stage routing to the matching Lambda alias (the `${stageVariables.alias}` reference in the Lambda integration URI selects the alias at runtime).
+
+Pass a different alias name via Serverless Framework's standard alias parameter to deploy a **parallel routing surface** for that alias on the **same** REST and WebSocket APIs as the framework stage:
+
+```bash
+# Default deploy: creates / updates the `prod` API Gateway stage and
+# the `prod` Lambda alias; /prod/* routes to the :prod Lambda alias.
+sls deploy --stage prod
+
+# Multi-alias deploy: creates / updates an `rc` API Gateway stage and
+# the `rc` Lambda alias on the same APIs; /rc/* routes to the :rc alias.
+# The `prod` stage's API definition is refreshed to match the latest deploy
+# but its alias routing (-> :prod) is preserved.
+sls deploy --stage prod --param alias=rc
+```
+
+This is the canonical pattern for in-stack blue/green: a single CloudFormation stack and a single API Gateway with multiple stages, each routing to a different Lambda alias version. After both deploys above:
+
+- `https://<api-id>.execute-api.<region>.amazonaws.com/prod/...` invokes the `:prod` Lambda alias
+- `https://<api-id>.execute-api.<region>.amazonaws.com/rc/...` invokes the `:rc` Lambda alias
+
+Each managed stage receives the stage variable `alias` set to that stage's name. The plugin templates each Lambda integration URI with `:${stageVariables.alias}`, so API Gateway substitutes the variable at request time and routes the invocation to the correct Lambda alias.
+
+The plugin only creates/updates the alias being deployed; on multi-alias deploys it also refreshes the framework stage's deployment so both stages stay in sync on API definition. It never deletes existing stages.
+
+#### Shared stack caveats
+
+All aliases share one CloudFormation stack, so only the Lambda **code version** is isolated per alias. Environment variables, IAM roles, other stack resources, API Gateway resources and methods, and `$LATEST` are shared and reflect whichever alias deployed last. If you need fully isolated infrastructure per alias, deploy separate stages instead.
+
+A stage the plugin creates for a new alias starts with API Gateway's default stage settings. Logging, tracing, throttling, caching and WAF associations are not copied from the framework stage.
+
+#### Cleanup behavior (important)
+
+This plugin is intentionally **non-destructive** for alias lifecycle:
+
+- It creates/updates API Gateway stages and Lambda aliases as needed.
+- It does **not** automatically delete stale API Gateway stages.
+- It does **not** automatically delete stale Lambda aliases.
+
+If an alias is no longer needed (for example `rc` after testing), clean it up explicitly via AWS CLI or console.
+
+Example cleanup commands:
+
+```bash
+# REST API stage
+aws apigateway delete-stage --rest-api-id <rest-api-id> --stage-name <alias> --region <region>
+
+# WebSocket API stage
+aws apigatewayv2 delete-stage --api-id <websocket-api-id> --stage-name <alias> --region <region>
+
+# Lambda alias (repeat per function)
+aws lambda delete-alias --function-name <lambda-function-name> --name <alias> --region <region>
+```
+
+#### CloudFormation stack output discovery
+
+If you do not pre-set `provider.apiGateway.restApiId` or `provider.websocketApiId`, the plugin discovers them at deploy time from the standard Serverless Framework outputs `ServiceEndpoint` and `ServiceEndpointWebsocket`. No additional configuration is required for services whose REST and WebSocket APIs are created by the same CloudFormation stack.
 
 ### Excluding Functions
 
