@@ -262,6 +262,23 @@ Additionally, you can use CLI flags to override these skip settings during deplo
 
 These flags take precedence over the configuration in serverless.yml and set the corresponding skip option to true when present.
 
+### Async invoke settings on the alias
+
+Serverless compiles a function's `maximumRetryAttempts` and `maximumEventAge` into an `EventInvokeConfig` on `$LATEST` only. An alias carries its own `EventInvokeConfig`, so anything invoking the alias asynchronously otherwise runs on Lambda's defaults (2 retries, 6 hour event age) no matter what `serverless.yml` says.
+
+After the aliases are created or updated, the plugin mirrors those two settings onto the alias for every function that declares either of them, on every deploy. The `$LATEST` config is left untouched, functions that declare neither setting are not modified, and `destinations` are not mirrored.
+
+To opt out:
+
+```yaml
+custom:
+  alias:
+    name: dev
+    skipEventInvokeConfig: true
+```
+
+or pass `--skip-event-invoke-config` on the command line.
+
 ## Plugin Compatibility and Limitations
 
 When using this plugin, be aware of the following compatibility considerations:
