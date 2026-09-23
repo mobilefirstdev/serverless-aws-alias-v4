@@ -57,6 +57,7 @@ class ServerlessLambdaAliasPlugin {
 			verbose: false,
 			skipApiGateway: false,
 			skipWebSocketGateway: false,
+			skipEventInvokeConfig: false,
 			region: this.provider.getRegion(),
 			restApiId: this.serverless.service.provider.apiGateway?.restApiId,
 			websocketApiId: this.serverless.service.provider.websocketApiId,
@@ -196,6 +197,10 @@ class ServerlessLambdaAliasPlugin {
 		// Load Skip WebSocket Gateway (with CLI flag override)
 		this.config.skipWebSocketGateway =
 			process.argv.includes('--skip-websocket-gateway') || (CUSTOM_ALIAS_CONFIG.skipWebSocketGateway ?? false);
+
+		// Load Skip EventInvokeConfig (with CLI flag override)
+		this.config.skipEventInvokeConfig =
+			process.argv.includes('--skip-event-invoke-config') || (CUSTOM_ALIAS_CONFIG.skipEventInvokeConfig ?? false);
 
 		// Check what event types are used in this service
 		const { hasHttpEvents, hasWebsocketEvents } = this.detectEventTypes();
@@ -442,6 +447,9 @@ class ServerlessLambdaAliasPlugin {
 			// Create/update Lambda function aliases
 			const CREATED_ALIASES = await this.createOrUpdateFunctionAliases(FUNCTIONS);
 
+			// Every aliased function, not only those republished this deploy, so the first deploy after enabling covers the whole service
+			await this.applyAliasEventInvokeConfigs(FUNCTIONS);
+
 			if (CREATED_ALIASES.length === 0) {
 				this.debugLog(
 					'No aliases were created or updated. Consider using the --force flag to force alias deployment if needed.',
@@ -636,10 +644,75 @@ class ServerlessLambdaAliasPlugin {
 				environment: MERGED_ENV,
 				events: funcDef.events || [],
 				description: funcDef.description || '',
+				maximumRetryAttempts: funcDef.maximumRetryAttempts,
+				maximumEventAge: funcDef.maximumEventAge,
+				destinations: funcDef.destinations,
 			});
 		});
 
 		return FUNCTIONS;
+	}
+
+	/**
+	 * Mirrors each function's `maximumRetryAttempts` / `maximumEventAge` onto its alias.
+	 *
+	 * Serverless compiles those settings into an EventInvokeConfig on `$LATEST` only, and an
+	 * alias carries its own EventInvokeConfig, so an alias-qualified async invoke otherwise runs
+	 * on Lambda's defaults (2 retries, 6h event age). Additive: functions declaring neither
+	 * setting are left untouched and the `$LATEST` config is never modified. `destinations`
+	 * are not mirrored.
+	 */
+	async applyAliasEventInvokeConfigs(functions) {
+		if (this.config.skipEventInvokeConfig) {
+			this.debugLog('Skipping alias EventInvokeConfig (skipEventInvokeConfig is set)');
+			return;
+		}
+
+		const LAMBDA = this.getSdkClient('Lambda');
+		const FAILED_FUNCTIONS = [];
+
+		for (const FUNCTION of functions) {
+			const HAS_RETRIES = FUNCTION.maximumRetryAttempts !== undefined;
+			const HAS_MAX_AGE = FUNCTION.maximumEventAge !== undefined;
+
+			if (!HAS_RETRIES && !HAS_MAX_AGE) continue;
+
+			if (FUNCTION.destinations) {
+				this.debugLog(
+					`Function '${FUNCTION.name}' declares destinations, which are not mirrored onto the alias; only maximumRetryAttempts and maximumEventAge are`,
+					{ forceShow: true, type: 'warning' },
+				);
+			}
+
+			const PARAMS = {
+				FunctionName: FUNCTION.functionName,
+				Qualifier: this.config.alias,
+			};
+			if (HAS_RETRIES) PARAMS.MaximumRetryAttempts = FUNCTION.maximumRetryAttempts;
+			if (HAS_MAX_AGE) PARAMS.MaximumEventAgeInSeconds = FUNCTION.maximumEventAge;
+
+			try {
+				await this.retryOnThrottle(`putFunctionEventInvokeConfig(${FUNCTION.functionName}:${this.config.alias})`, () =>
+					LAMBDA.putFunctionEventInvokeConfig(PARAMS).promise(),
+				);
+				this.debugLog(
+					`Applied EventInvokeConfig to '${FUNCTION.functionName}:${this.config.alias}' (retries=${HAS_RETRIES ? PARAMS.MaximumRetryAttempts : 'default'}, maxAge=${HAS_MAX_AGE ? `${PARAMS.MaximumEventAgeInSeconds}s` : 'default'})`,
+					{ type: 'success' },
+				);
+			} catch (error) {
+				this.debugLog(
+					`Error applying EventInvokeConfig to '${FUNCTION.functionName}:${this.config.alias}': ${error.message}`,
+					{ forceShow: true, type: 'error' },
+				);
+				FAILED_FUNCTIONS.push(FUNCTION.functionName);
+			}
+		}
+
+		if (FAILED_FUNCTIONS.length > 0) {
+			throw new Error(
+				`Failed to apply EventInvokeConfig to ${FAILED_FUNCTIONS.length} function alias(es): ${FAILED_FUNCTIONS.join(', ')}`,
+			);
+		}
 	}
 
 	/**
